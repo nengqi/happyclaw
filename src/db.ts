@@ -1248,7 +1248,44 @@ export function initDatabase(): void {
     db.exec('ALTER TABLE sessions ADD COLUMN provider_id TEXT');
   }
 
-  const SCHEMA_VERSION = '37';
+  // v37 → v38: Multi-tenant routing — sender → user 映射 + per-user 静态 skill + per-user 凭证
+  // 配合 shared bot + auto-register（fork: nengqi/happyclaw#feat/multi-tenant-router）
+  // - feishu_open_id: 飞书发送者 open_id → happyclaw user 路由 key（admin phase 1 setup 时手填）
+  // - enabled_skills: per-user 静态启用 skill 列表（JSON array），admin 全挂普通用户按 list 子集
+  // - user_secrets: AES-256-GCM 加密 JSON {anthropic_key?, git_token?, feishu_app_credentials?}，
+  //   default 模板复制时严禁带 admin 自己的凭证（避免 N user 共享 Max key 互抢 5h window）
+  if (
+    !db
+      .prepare("PRAGMA table_info('users')")
+      .all()
+      .some((c: any) => c.name === 'feishu_open_id')
+  ) {
+    db.exec('ALTER TABLE users ADD COLUMN feishu_open_id TEXT');
+    // partial unique index: 多个 NULL 共存（旧用户没填），非 NULL 必须唯一
+    db.exec(
+      'CREATE UNIQUE INDEX IF NOT EXISTS idx_users_feishu_open_id ON users(feishu_open_id) WHERE feishu_open_id IS NOT NULL',
+    );
+  }
+  if (
+    !db
+      .prepare("PRAGMA table_info('users')")
+      .all()
+      .some((c: any) => c.name === 'enabled_skills')
+  ) {
+    db.exec(
+      "ALTER TABLE users ADD COLUMN enabled_skills TEXT NOT NULL DEFAULT '[]'",
+    );
+  }
+  if (
+    !db
+      .prepare("PRAGMA table_info('users')")
+      .all()
+      .some((c: any) => c.name === 'user_secrets')
+  ) {
+    db.exec('ALTER TABLE users ADD COLUMN user_secrets TEXT');
+  }
+
+  const SCHEMA_VERSION = '38';
   db.prepare(
     'INSERT OR REPLACE INTO router_state (key, value) VALUES (?, ?)',
   ).run('schema_version', SCHEMA_VERSION);
