@@ -844,6 +844,23 @@ export function createFeishuConnection(
       'Feishu message received',
     );
 
+    // Multi-tenant chat 白名单：只监听指定群聊/私聊（plan F4）。
+    // shared bot 常在多个团队群里，不加白名单会响应所有群（污染）。空 env = 不限制（flag-off 安全）。
+    const allowedChatsEnv = process.env.MULTI_TENANT_ALLOWED_CHATS;
+    if (allowedChatsEnv) {
+      const allowed = allowedChatsEnv
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean);
+      if (allowed.length && !allowed.includes(chatId)) {
+        logger.info(
+          { chatId, messageId },
+          'Chat not in MULTI_TENANT_ALLOWED_CHATS, ignoring',
+        );
+        return;
+      }
+    }
+
     if (
       ignoreMessagesBefore &&
       createTimeMs > 0 &&
