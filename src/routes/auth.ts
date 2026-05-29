@@ -88,6 +88,8 @@ export function toUserPublic(u: User): UserPublic {
     ai_avatar_color: u.ai_avatar_color ?? null,
     ai_avatar_url: u.ai_avatar_url ?? null,
     default_require_mention: u.default_require_mention,
+    feishu_open_id: u.feishu_open_id ?? null,
+    enabled_skills: u.enabled_skills ?? [],
     created_at: u.created_at,
     last_login_at: u.last_login_at,
     last_active_at: null,

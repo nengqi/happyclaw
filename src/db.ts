@@ -662,6 +662,18 @@ export function initDatabase(): void {
     'default_require_mention',
     'INTEGER NOT NULL DEFAULT 0',
   );
+  // v38 → v39: Multi-tenant (shared bot) routing — sender → user 映射 + per-user
+  // 静态 skill + per-user 凭证。配合 shared bot + auto-register（fork: 多租户路由）。
+  // - feishu_open_id: 飞书 sender open_id → happyclaw user 路由 key（admin 手填 / member auto-register 写入）
+  // - enabled_skills: per-user 静态启用 skill 列表（JSON array），admin 全挂普通用户按子集挂
+  // - user_secrets: 预留 per-user 凭证列（暂不写入，default 模板复制时严禁带 admin 凭证）
+  ensureColumn('users', 'feishu_open_id', 'TEXT');
+  // partial unique index: 多个 NULL 共存（旧用户没填），非 NULL 必须唯一（1:1 路由）
+  db.exec(
+    'CREATE UNIQUE INDEX IF NOT EXISTS idx_users_feishu_open_id ON users(feishu_open_id) WHERE feishu_open_id IS NOT NULL',
+  );
+  ensureColumn('users', 'enabled_skills', "TEXT NOT NULL DEFAULT '[]'");
+  ensureColumn('users', 'user_secrets', 'TEXT');
   ensureColumn('scheduled_tasks', 'created_by', 'TEXT');
   ensureColumn('scheduled_tasks', 'execution_type', "TEXT DEFAULT 'agent'");
   ensureColumn('scheduled_tasks', 'script_command', 'TEXT');
@@ -830,6 +842,9 @@ export function initDatabase(): void {
     'ai_avatar_color',
     'ai_avatar_url',
     'default_require_mention',
+    'feishu_open_id',
+    'enabled_skills',
+    'user_secrets',
     'created_at',
     'updated_at',
     'last_login_at',
@@ -1261,7 +1276,11 @@ export function initDatabase(): void {
   // its position before assertSchema('users', …) matters because the
   // schema check would otherwise reject pre-v38 databases on startup.
 
-  const SCHEMA_VERSION = '38';
+  // v38 → v39: Added users.feishu_open_id / enabled_skills / user_secrets for
+  // multi-tenant (shared bot) routing. ensureColumn migrations run above with
+  // the other users.* additions (before assertSchema('users', …)).
+
+  const SCHEMA_VERSION = '39';
   db.prepare(
     'INSERT OR REPLACE INTO router_state (key, value) VALUES (?, ?)',
   ).run('schema_version', SCHEMA_VERSION);
@@ -3263,6 +3282,20 @@ function parseJsonDetails(raw: unknown): Record<string, unknown> | null {
   }
 }
 
+/** Safely parse the enabled_skills JSON column into a string[] (empty on any error). */
+function parseEnabledSkills(raw: unknown): string[] {
+  if (typeof raw !== 'string' || !raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed)) {
+      return parsed.filter((s): s is string => typeof s === 'string');
+    }
+  } catch {
+    // corrupt JSON — treat as empty
+  }
+  return [];
+}
+
 function mapUserRow(row: Record<string, unknown>): User {
   const role = parseUserRole(row.role);
   const status = parseUserStatus(row.status);
@@ -3292,6 +3325,9 @@ function mapUserRow(row: Record<string, unknown>): User {
     ai_avatar_url:
       typeof row.ai_avatar_url === 'string' ? row.ai_avatar_url : null,
     default_require_mention: !!row.default_require_mention,
+    feishu_open_id:
+      typeof row.feishu_open_id === 'string' ? row.feishu_open_id : null,
+    enabled_skills: parseEnabledSkills(row.enabled_skills),
     created_at: String(row.created_at),
     updated_at: String(row.updated_at),
     last_login_at:
@@ -3319,6 +3355,8 @@ function toUserPublic(user: User, lastActiveAt: string | null): UserPublic {
     ai_avatar_color: user.ai_avatar_color,
     ai_avatar_url: user.ai_avatar_url,
     default_require_mention: user.default_require_mention,
+    feishu_open_id: user.feishu_open_id,
+    enabled_skills: user.enabled_skills,
     created_at: user.created_at,
     last_login_at: user.last_login_at,
     last_active_at: lastActiveAt,
@@ -3468,6 +3506,42 @@ export function getUserByUsername(username: string): User | undefined {
     .prepare('SELECT * FROM users WHERE username = ?')
     .get(username) as Record<string, unknown> | undefined;
   return row ? mapUserRow(row) : undefined;
+}
+
+// ── Multi-tenant (shared bot) routing helpers ──
+// feishu_open_id → happyclaw user，配合 shared bot + sender 路由 + auto-register。
+
+/**
+ * Resolve a HappyClaw user by their Feishu sender open_id.
+ * Used by the shared-bot router to map an inbound senderOpenId → target user.
+ * Excludes soft-deleted users (deleted_at IS NOT NULL).
+ */
+export function getUserByFeishuOpenId(openId: string): User | undefined {
+  if (!openId) return undefined;
+  const row = db
+    .prepare(
+      'SELECT * FROM users WHERE feishu_open_id = ? AND deleted_at IS NULL',
+    )
+    .get(openId) as Record<string, unknown> | undefined;
+  return row ? mapUserRow(row) : undefined;
+}
+
+/**
+ * Bind a Feishu sender open_id to a user (multi-tenant routing key).
+ * The partial unique index on users(feishu_open_id) enforces a 1:1 mapping;
+ * a duplicate open_id throws a UNIQUE constraint error.
+ */
+export function setUserFeishuOpenId(userId: string, openId: string): void {
+  db.prepare(
+    'UPDATE users SET feishu_open_id = ?, updated_at = ? WHERE id = ?',
+  ).run(openId, new Date().toISOString(), userId);
+}
+
+/** Overwrite a user's enabled_skills list (stored as a JSON array). */
+export function setUserEnabledSkills(userId: string, skills: string[]): void {
+  db.prepare(
+    'UPDATE users SET enabled_skills = ?, updated_at = ? WHERE id = ?',
+  ).run(JSON.stringify(skills), new Date().toISOString(), userId);
 }
 
 export interface ListUsersOptions {

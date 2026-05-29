@@ -117,6 +117,13 @@ export interface ConnectFeishuOptions {
   isSenderAllowedInGroup?: (chatJid: string, senderImId?: string) => boolean;
   onCardInterrupt?: (chatJid: string) => void;
   onP2pSender?: (senderOpenId: string) => void;
+  /** Multi-tenant（shared bot）sender 路由钩子；仅 MULTI_TENANT_MODE 下注入。详见 feishu.ts ConnectOptions */
+  onSenderRoute?: (
+    senderOpenId: string,
+    senderName: string,
+    chatJid: string,
+    chatType: 'p2p' | 'group' | string | undefined,
+  ) => Promise<string | null>;
 }
 
 class IMConnectionManager {
@@ -460,6 +467,7 @@ class IMConnectionManager {
       isSenderAllowedInGroup: options?.isSenderAllowedInGroup,
       onCardInterrupt: options?.onCardInterrupt,
       onP2pSender: options?.onP2pSender,
+      onSenderRoute: options?.onSenderRoute,
     });
   }
 

@@ -33,6 +33,10 @@ import {
 import {
   closeDatabase,
   createTask,
+  createUser,
+  getUserByFeishuOpenId,
+  setUserFeishuOpenId,
+  setUserEnabledSkills,
   deleteExpiredSessions,
   getExpiredSessionIds,
   deleteTask,
@@ -176,7 +180,9 @@ import {
   RegisteredGroup,
   StreamEvent,
   SubAgent,
+  User,
 } from './types.js';
+import { generateUserId, hashPassword } from './auth.js';
 import { logger } from './logger.js';
 import { resolveTaskOwner } from './task-utils.js';
 import { resolvePerMessageRuntimeOwner } from './runtime-owner.js';
@@ -224,6 +230,20 @@ process.env.TZ = process.env.TZ || TIMEZONE;
 
 const GROUP_SYNC_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
 const execFileAsync = promisify(execFile);
+
+// ── Multi-tenant（shared bot）feature flag ──
+// 开启时：只连 admin 的飞书 bot 当全局共享入口，按 senderOpenId 路由到对应 user 的 home，
+// 新 sender 首次发消息 auto-register。关闭（默认）时行为与 upstream per-user bot 完全一致。
+const MULTI_TENANT_MODE = process.env.MULTI_TENANT_MODE === 'true';
+// auto-register 时给新 member 写入的默认 enabled_skills（逗号分隔）。
+// 留空 = []（Phase 1 不做 skill 过滤，容器全挂）。
+const MULTI_TENANT_DEFAULT_SKILLS = (
+  process.env.MULTI_TENANT_DEFAULT_SKILLS || ''
+)
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean);
+
 const DEFAULT_MAIN_JID = 'web:main';
 const DEFAULT_MAIN_NAME = 'Main';
 const SAFE_REQUEST_ID_RE = /^[A-Za-z0-9_-]+$/;
@@ -7491,6 +7511,175 @@ async function ensureDockerRunning(): Promise<void> {
 }
 
 /**
+ * Multi-tenant（shared bot）: resolve or auto-register the HappyClaw user behind
+ * a Feishu sender open_id.
+ *
+ * - 已存在（feishu_open_id 命中）→ 直接返回该 user。
+ * - 不存在 → 创建 role=member user（随机不可登录密码，IM-only）+ ensureUserHomeGroup
+ *   建 home-{userId}（container 沙盒模式）+ 写默认 enabled_skills + 绑定 feishu_open_id，再返回。
+ *
+ * 沙盒隔离：role='member' → ensureUserHomeGroup 默认建 container 执行模式的 home
+ * （db.ts: member → executionMode='container'），绝不设 host。Agent 在容器里跑，
+ * 删文件只影响容器、不碰宿主机。
+ *
+ * 严禁复制 admin 凭证：新 user 的 user_secrets 留空，继承共享网关。
+ * 并发首条消息可能撞 UNIQUE(feishu_open_id) — 捕获后重新查询返回既有 user（幂等）。
+ */
+async function ensureFeishuUser(
+  openId: string,
+  displayName: string,
+): Promise<User | null> {
+  if (!openId) return null;
+
+  const existing = getUserByFeishuOpenId(openId);
+  if (existing) return existing;
+
+  const now = new Date().toISOString();
+  const userId = generateUserId();
+  // IM-only user：随机不可登录密码（不暴露任何 admin 凭证）
+  const passwordHash = await hashPassword(generateUserId() + generateUserId());
+  // 用户名需唯一 + 满足 validateUsername；open_id 取后 8 位避免过长，撞名极少见但兜底重试
+  const baseName = `feishu_${openId.replace(/[^A-Za-z0-9_-]/g, '').slice(-8)}`;
+
+  try {
+    createUser({
+      id: userId,
+      username: baseName,
+      password_hash: passwordHash,
+      display_name: displayName || baseName,
+      role: 'member',
+      status: 'active',
+      created_at: now,
+      updated_at: now,
+    });
+  } catch (err) {
+    // 用户名撞车（极罕见）→ 退到加 userId 后缀重试一次
+    if (
+      err instanceof Error &&
+      err.message.includes('UNIQUE constraint failed: users.username')
+    ) {
+      createUser({
+        id: userId,
+        username: `${baseName}_${userId.slice(0, 6)}`,
+        password_hash: passwordHash,
+        display_name: displayName || baseName,
+        role: 'member',
+        status: 'active',
+        created_at: now,
+        updated_at: now,
+      });
+    } else {
+      throw err;
+    }
+  }
+
+  try {
+    setUserFeishuOpenId(userId, openId);
+  } catch (err) {
+    // 并发：另一进程/消息已为同一 open_id 建好 user → 复用既有（本次新建的 user 成孤儿，无害）
+    if (
+      err instanceof Error &&
+      err.message.includes('UNIQUE constraint failed')
+    ) {
+      logger.info(
+        { openId, userId },
+        'Multi-tenant: feishu_open_id already bound (race), reusing existing user',
+      );
+      const winner = getUserByFeishuOpenId(openId);
+      if (winner) return winner;
+    }
+    throw err;
+  }
+
+  if (MULTI_TENANT_DEFAULT_SKILLS.length > 0) {
+    setUserEnabledSkills(userId, MULTI_TENANT_DEFAULT_SKILLS);
+  }
+
+  // 建 home-{userId}（member → container 沙盒模式，由 ensureUserHomeGroup 默认决定），
+  // 同时初始化 user-global CLAUDE.md 模板。绝不传 'admin'（那会变 host 模式 + 共享 main）。
+  try {
+    ensureUserHomeGroup(userId, 'member', displayName || baseName);
+  } catch (err) {
+    logger.warn(
+      { err, userId, openId },
+      'Multi-tenant: failed to ensure home group for auto-registered user',
+    );
+  }
+
+  logger.info(
+    { userId, openId, displayName },
+    'Multi-tenant: auto-registered new Feishu user',
+  );
+
+  return getUserById(userId) ?? null;
+}
+
+/**
+ * Build the onSenderRoute callback for the shared Feishu bot (MULTI_TENANT_MODE).
+ *
+ * 解析 senderOpenId → 目标 user（含 auto-register），再把 chatJid 绑定到该 user 的
+ * home folder，使后续消息轮询按 chat_jid → folder 路由到正确容器。
+ *
+ * 关键解耦：IM 连接归 admin 所有（adminUserId），故 chatJid 的 created_by 设为
+ * adminUserId 让出站回复经 admin 的共享 bot 送达；folder 设为目标 user 的 home
+ * 让入站消息进对应容器。返回目标 userId（成功）或 null（无法解析，丢弃）。
+ *
+ * @param adminUserId 拥有共享 bot 飞书连接的 admin user id（出站回复路由用）
+ */
+function buildOnSenderRoute(
+  adminUserId: string,
+): (
+  senderOpenId: string,
+  senderName: string,
+  chatJid: string,
+  chatType: 'p2p' | 'group' | string | undefined,
+) => Promise<string | null> {
+  return async (senderOpenId, senderName, chatJid) => {
+    let user: User | null;
+    try {
+      user = await ensureFeishuUser(senderOpenId, senderName);
+    } catch (err) {
+      logger.error(
+        { err, senderOpenId, chatJid },
+        'Multi-tenant: ensureFeishuUser failed',
+      );
+      return null;
+    }
+    if (!user) return null;
+
+    const homeGroup = getUserHomeGroup(user.id);
+    const homeFolder = homeGroup?.folder ?? `home-${user.id}`;
+
+    // 绑定/重绑 chatJid → 目标 user 的 home folder。
+    // created_by=adminUserId：出站回复经 admin 共享 bot；folder=目标 user home：入站进对应容器。
+    const existing = registeredGroups[chatJid] ?? getRegisteredGroup(chatJid);
+    const needsBind =
+      !existing ||
+      existing.folder !== homeFolder ||
+      existing.created_by !== adminUserId;
+
+    if (needsBind) {
+      const chatName =
+        existing?.name || (senderName ? `${senderName} (飞书)` : '飞书会话');
+      registerGroup(chatJid, {
+        name: chatName,
+        folder: homeFolder,
+        added_at: existing?.added_at ?? new Date().toISOString(),
+        created_by: adminUserId,
+        is_home: false,
+        owner_im_id: existing?.owner_im_id,
+      });
+      logger.info(
+        { chatJid, senderOpenId, userId: user.id, homeFolder },
+        'Multi-tenant: bound Feishu chat to user home folder',
+      );
+    }
+
+    return user.id;
+  };
+}
+
+/**
  * Build the onNewChat callback for IM connections.
  * Feishu/Telegram chats auto-register to the user's home group folder.
  *
@@ -8314,6 +8503,14 @@ async function connectUserIMChannels(
   discordConfig?: DiscordConnectConfig | null,
   whatsappConfig?: WhatsAppConnectConfig | null,
   ignoreMessagesBefore?: number,
+  // Multi-tenant（shared bot）：仅 MULTI_TENANT_MODE 下注入 feishu sender 路由钩子。
+  // 未传（默认）时 feishu.ts 走原 onNewChat/onP2pSender 路径，行为完全不变。
+  onSenderRoute?: (
+    senderOpenId: string,
+    senderName: string,
+    chatJid: string,
+    chatType: 'p2p' | 'group' | string | undefined,
+  ) => Promise<string | null>,
 ): Promise<{
   feishu: boolean;
   telegram: boolean;
@@ -8357,6 +8554,7 @@ async function connectUserIMChannels(
           isSenderAllowedInGroup,
           onCardInterrupt: handleCardInterrupt,
           onP2pSender: onFeishuP2pSender,
+          onSenderRoute,
         })
       : Promise.resolve(false);
 
@@ -9598,11 +9796,102 @@ async function main(): Promise<void> {
 
   let anyFeishuConnected = false;
 
+  // ── Multi-tenant（shared bot）模式：只连 admin 的飞书 bot 当全局共享入口 ──
+  // 按 senderOpenId 路由到对应 user 的 home（container 沙盒），新 sender auto-register。
+  // 跳过下方 per-user IM 连接循环（避免与共享 bot 抢同一飞书 app）。
+  // flag-off（默认）时这整块不执行，走原 per-user 连接。
+  if (MULTI_TENANT_MODE) {
+    const adminUser = allActiveUsers.find((u) => u.role === 'admin');
+    if (!adminUser) {
+      logger.warn(
+        'MULTI_TENANT_MODE on but no active admin user found — shared bot not started',
+      );
+    } else {
+      // admin feishu_open_id 启动兜底：env 设了且 admin 还没绑 → 回填，
+      // 否则 admin 自己 P2P 会被当陌生 sender auto-register 出影子 member 账号。
+      const adminFeishuOpenIdEnv = process.env.ADMIN_FEISHU_OPEN_ID;
+      if (adminFeishuOpenIdEnv && !adminUser.feishu_open_id) {
+        setUserFeishuOpenId(adminUser.id, adminFeishuOpenIdEnv);
+        logger.info(
+          { adminUserId: adminUser.id },
+          'Backfilled admin feishu_open_id from ADMIN_FEISHU_OPEN_ID env',
+        );
+      }
+      // admin 的 feishu 配置：per-user > global fallback（与下方 per-user 推导一致）
+      const adminUserFeishu = getUserFeishuConfig(adminUser.id);
+      let sharedFeishu: FeishuConnectConfig | null = null;
+      if (
+        adminUserFeishu &&
+        adminUserFeishu.appId &&
+        adminUserFeishu.appSecret
+      ) {
+        sharedFeishu = {
+          appId: adminUserFeishu.appId,
+          appSecret: adminUserFeishu.appSecret,
+          enabled: adminUserFeishu.enabled,
+        };
+      } else if (globalFeishuConfig.source !== 'none') {
+        const gc = globalFeishuConfig.config;
+        sharedFeishu = {
+          appId: gc.appId,
+          appSecret: gc.appSecret,
+          enabled: gc.enabled,
+        };
+      }
+
+      const adminHome = getUserHomeGroup(adminUser.id);
+      if (
+        sharedFeishu &&
+        sharedFeishu.enabled !== false &&
+        sharedFeishu.appId &&
+        sharedFeishu.appSecret &&
+        adminHome
+      ) {
+        const onSenderRoute = buildOnSenderRoute(adminUser.id);
+        try {
+          // 复用 upstream 的 connectUserIMChannels（含 provider failover / owner ref / 群守卫）。
+          // 只传 feishuConfig + onSenderRoute，其它渠道 null。
+          const result = await connectUserIMChannels(
+            adminUser.id,
+            adminHome.folder,
+            sharedFeishu,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            Date.now(),
+            onSenderRoute,
+          );
+          if (result.feishu) anyFeishuConnected = true;
+          logger.info(
+            { adminUserId: adminUser.id, feishu: result.feishu },
+            'Multi-tenant shared Feishu bot connected',
+          );
+        } catch (err) {
+          logger.error(
+            { err, adminUserId: adminUser.id },
+            'Failed to connect multi-tenant shared Feishu bot',
+          );
+        }
+      } else {
+        logger.warn(
+          { adminUserId: adminUser.id },
+          'MULTI_TENANT_MODE on but admin has no valid Feishu config or home group — shared bot not started',
+        );
+      }
+    }
+    // 不进入 per-user 连接循环（共享 bot 已是唯一飞书入口）。
+    // group sync 由下方统一的 `if (anyFeishuConnected)` 块启动。
+  }
+
   // Connect each user's IM channels concurrently — startup latency was
   // previously O(N_users) because the await was inside the for-loop. The
   // per-user `connectUserIMChannels` already parallelizes within a user, so
   // wrapping the outer loop in Promise.allSettled drops total cold-start to
   // ~max(per-user latency).
+  if (!MULTI_TENANT_MODE)
   await Promise.allSettled(allActiveUsers.map(async (user) => {
     const homeGroup = getUserHomeGroup(user.id);
     if (!homeGroup) return;
