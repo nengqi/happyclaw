@@ -3106,7 +3106,24 @@ function mapUserRow(row: Record<string, unknown>): User {
     last_login_at:
       typeof row.last_login_at === 'string' ? row.last_login_at : null,
     deleted_at: typeof row.deleted_at === 'string' ? row.deleted_at : null,
+    feishu_open_id:
+      typeof row.feishu_open_id === 'string' ? row.feishu_open_id : null,
+    enabled_skills: parseEnabledSkills(row.enabled_skills),
   };
+}
+
+/** Safely parse the enabled_skills JSON column into a string[] (empty on any error). */
+function parseEnabledSkills(raw: unknown): string[] {
+  if (typeof raw !== 'string' || !raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed)) {
+      return parsed.filter((s): s is string => typeof s === 'string');
+    }
+  } catch {
+    // corrupt JSON — treat as empty
+  }
+  return [];
 }
 
 function toUserPublic(user: User, lastActiveAt: string | null): UserPublic {
@@ -3131,6 +3148,8 @@ function toUserPublic(user: User, lastActiveAt: string | null): UserPublic {
     last_login_at: user.last_login_at,
     last_active_at: lastActiveAt,
     deleted_at: user.deleted_at,
+    feishu_open_id: user.feishu_open_id,
+    enabled_skills: user.enabled_skills,
   };
 }
 
@@ -3276,6 +3295,42 @@ export function getUserByUsername(username: string): User | undefined {
     .prepare('SELECT * FROM users WHERE username = ?')
     .get(username) as Record<string, unknown> | undefined;
   return row ? mapUserRow(row) : undefined;
+}
+
+// ── Multi-tenant (shared bot) routing helpers ──
+// feishu_open_id → happyclaw user，配合 shared bot + sender 路由 + auto-register。
+
+/**
+ * Resolve a HappyClaw user by their Feishu sender open_id.
+ * Used by the shared-bot router to map an inbound senderOpenId → target user.
+ * Excludes soft-deleted users (deleted_at IS NOT NULL).
+ */
+export function getUserByFeishuOpenId(openId: string): User | undefined {
+  if (!openId) return undefined;
+  const row = db
+    .prepare(
+      'SELECT * FROM users WHERE feishu_open_id = ? AND deleted_at IS NULL',
+    )
+    .get(openId) as Record<string, unknown> | undefined;
+  return row ? mapUserRow(row) : undefined;
+}
+
+/**
+ * Bind a Feishu sender open_id to a user (multi-tenant routing key).
+ * The partial unique index on users(feishu_open_id) enforces a 1:1 mapping;
+ * a duplicate open_id throws a UNIQUE constraint error.
+ */
+export function setUserFeishuOpenId(userId: string, openId: string): void {
+  db.prepare(
+    'UPDATE users SET feishu_open_id = ?, updated_at = ? WHERE id = ?',
+  ).run(openId, new Date().toISOString(), userId);
+}
+
+/** Overwrite a user's enabled_skills list (stored as a JSON array). */
+export function setUserEnabledSkills(userId: string, skills: string[]): void {
+  db.prepare(
+    'UPDATE users SET enabled_skills = ?, updated_at = ? WHERE id = ?',
+  ).run(JSON.stringify(skills), new Date().toISOString(), userId);
 }
 
 export interface ListUsersOptions {

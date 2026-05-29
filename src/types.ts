@@ -210,6 +210,11 @@ export interface User {
   updated_at: string;
   last_login_at: string | null;
   deleted_at: string | null;
+  // Multi-tenant (shared bot) routing — see db.ts v37→v38 migration.
+  // feishu_open_id: 飞书 sender open_id → 该 user 的路由 key（admin 手填，member auto-register 时写入）
+  feishu_open_id: string | null;
+  // enabled_skills: per-user 静态启用 skill 名列表（JSON array），admin 全挂普通用户按子集挂
+  enabled_skills: string[];
 }
 
 export interface UserPublic {
@@ -233,6 +238,8 @@ export interface UserPublic {
   last_login_at: string | null;
   last_active_at: string | null;
   deleted_at: string | null;
+  feishu_open_id: string | null;
+  enabled_skills: string[];
 }
 
 export interface UserSession {

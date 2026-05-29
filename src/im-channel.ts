@@ -98,6 +98,13 @@ export interface IMChannelConnectOpts {
   onCardInterrupt?: (chatJid: string) => void;
   /** P2P（私聊）消息到达时调用，用于自动检测 owner open_id（仅飞书） */
   onP2pSender?: (senderOpenId: string) => void;
+  /** Multi-tenant（shared bot）sender 路由钩子（仅飞书，MULTI_TENANT_MODE 注入）。详见 feishu.ts ConnectOptions */
+  onSenderRoute?: (
+    senderOpenId: string,
+    senderName: string,
+    chatJid: string,
+    chatType: 'p2p' | 'group' | string | undefined,
+  ) => Promise<string | null>;
 }
 
 export interface IMChannel {
@@ -195,6 +202,7 @@ export function createFeishuChannel(config: FeishuConnectionConfig): IMChannel {
         isSenderAllowedInGroup: opts.isSenderAllowedInGroup,
         onCardInterrupt: opts.onCardInterrupt,
         onP2pSender: opts.onP2pSender,
+        onSenderRoute: opts.onSenderRoute,
       });
       if (!connected) {
         inner = null;

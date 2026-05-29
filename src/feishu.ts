@@ -69,6 +69,18 @@ export interface ConnectOptions {
   onCardInterrupt?: (chatJid: string) => void;
   /** P2P（私聊）消息到达时调用，用于自动检测 bot owner 的 open_id */
   onP2pSender?: (senderOpenId: string) => void;
+  /**
+   * Multi-tenant（shared bot）路由钩子：拿到 senderOpenId 后由调用方解析/创建
+   * 对应的 happyclaw user，并把该 chatJid 绑定到 user 的 home folder。
+   * 返回目标 userId（已就绪可路由）或 null（拒绝/无法解析，消息丢弃）。
+   * 仅在 MULTI_TENANT_MODE 下由 index.ts 注入；未注入时行为完全不变。
+   */
+  onSenderRoute?: (
+    senderOpenId: string,
+    senderName: string,
+    chatJid: string,
+    chatType: 'p2p' | 'group' | string | undefined,
+  ) => Promise<string | null>;
 }
 
 export interface FeishuChatInfo {
@@ -804,6 +816,7 @@ export function createFeishuConnection(
       isGroupOwnerMessage,
       isSenderAllowedInGroup,
       onP2pSender,
+      onSenderRoute,
     } = connectOptions || {};
     const {
       chatId,
@@ -869,12 +882,37 @@ export function createFeishuConnection(
     const resolvedSenderName = senderName || getSenderName(senderOpenId);
     const resolvedChatName = chatType === 'p2p' ? '飞书私聊' : '飞书群聊';
 
-    // 先注册会话，确保 resolveGroupFolder 能正确解析 folder（含首条文件消息场景）
-    onNewChat?.(chatJid, resolvedChatName);
+    // ── Multi-tenant（shared bot）路由 ──
+    // MULTI_TENANT_MODE 下注入 onSenderRoute：按 senderOpenId 解析/创建目标 user，
+    // 并把该 chatJid 绑定到该 user 的 home folder（在调用方完成）。返回 null = 拒绝/无法解析，丢弃。
+    // 注入时取代 per-user 的 onNewChat/onP2pSender owner 检测路径。
+    // Phase 1：只路由 P2P；群消息走下方 else 维持原 onNewChat（plan 风险4，群 sender 重绑留 phase 2）。
+    if (onSenderRoute && chatType === 'p2p') {
+      if (!senderOpenId) {
+        logger.debug({ chatJid, messageId }, 'Multi-tenant: missing senderOpenId, dropping');
+        return;
+      }
+      const routedUserId = await onSenderRoute(
+        senderOpenId,
+        resolvedSenderName,
+        chatJid,
+        chatType,
+      );
+      if (!routedUserId) {
+        logger.debug(
+          { chatJid, messageId, senderOpenId },
+          'Multi-tenant: sender route returned null, dropping message',
+        );
+        return;
+      }
+    } else {
+      // 先注册会话，确保 resolveGroupFolder 能正确解析 folder（含首条文件消息场景）
+      onNewChat?.(chatJid, resolvedChatName);
 
-    // P2P 消息：通知调用方用于自动检测 owner open_id
-    if (chatType === 'p2p' && senderOpenId && onP2pSender) {
-      onP2pSender(senderOpenId);
+      // P2P 消息：通知调用方用于自动检测 owner open_id
+      if (chatType === 'p2p' && senderOpenId && onP2pSender) {
+        onP2pSender(senderOpenId);
+      }
     }
 
     let attachmentsJson: string | undefined;

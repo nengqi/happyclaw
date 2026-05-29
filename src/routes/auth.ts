@@ -91,6 +91,8 @@ export function toUserPublic(u: User): UserPublic {
     last_login_at: u.last_login_at,
     last_active_at: null,
     deleted_at: u.deleted_at,
+    feishu_open_id: u.feishu_open_id ?? null,
+    enabled_skills: u.enabled_skills ?? [],
   };
 }
 
