@@ -96,7 +96,14 @@ import {
   touchImContextBindingActivity,
   updateAgentContextInfo,
   backfillEmptyAllowlistsForUser,
+  markBytedcliAuthPending,
+  markBytedcliAuthed,
+  markBytedcliAuthExpired,
 } from './db.js';
+import {
+  beginAuth as bytedcliBeginAuth,
+  pollComplete as bytedcliPollComplete,
+} from './bytedcli-auth.js';
 // feishu.js deprecated exports are no longer needed; imManager handles all connections
 import { imManager } from './im-manager.js';
 import {
@@ -1336,8 +1343,104 @@ async function handleCommand(
       return handleDisallowCommand(chatJid, senderImId, mentions);
     case 'allowlist':
       return handleAllowlistCommand(chatJid);
+    case 'login':
+      return handleLoginCommand(chatJid, senderImId);
     default:
       return null;
+  }
+}
+
+// ── /login: 多租户 per-user bytedcli SSO 入口 ──
+// 流程：sender open_id → user → bytedcli auth login --session --begin → 回 URL + 后台轮询
+//      → complete → markBytedcliAuthed → 下一条消息容器自动挂用户自己的 bytedcli 身份。
+// 详 bytedcli-auth.ts / bytedcli-identity.ts 状态机注释。
+const bytedcliPollTimers = new Map<string, NodeJS.Timeout>();
+const BYTEDCLI_POLL_INTERVAL_MS = 5_000;
+const BYTEDCLI_POLL_MAX_MS = 5 * 60 * 1000;
+
+function stopBytedcliAuthPolling(userId: string): void {
+  const t = bytedcliPollTimers.get(userId);
+  if (t) {
+    clearInterval(t);
+    bytedcliPollTimers.delete(userId);
+  }
+}
+
+function startBytedcliAuthPolling(
+  userId: string,
+  completeToken: string,
+  chatJid: string,
+): void {
+  stopBytedcliAuthPolling(userId);
+  const startedAt = Date.now();
+
+  const tick = async (): Promise<void> => {
+    if (Date.now() - startedAt > BYTEDCLI_POLL_MAX_MS) {
+      stopBytedcliAuthPolling(userId);
+      markBytedcliAuthExpired(userId);
+      imManager
+        .sendMessage(chatJid, 'bytedcli SSO 超时（5min 未完成），请重发 /login 重试')
+        .catch(() => {});
+      return;
+    }
+    try {
+      const r = await bytedcliPollComplete(userId, DATA_DIR, completeToken);
+      if (r.loginStatus === 'complete') {
+        stopBytedcliAuthPolling(userId);
+        markBytedcliAuthed(userId);
+        imManager
+          .sendMessage(
+            chatJid,
+            'bytedcli SSO 完成 ✓ 下一条消息开始用你自己的身份',
+          )
+          .catch(() => {});
+      } else if (r.loginStatus === 'expired') {
+        stopBytedcliAuthPolling(userId);
+        markBytedcliAuthExpired(userId);
+        imManager
+          .sendMessage(chatJid, 'bytedcli SSO 已过期，请重发 /login 重试')
+          .catch(() => {});
+      }
+      // pending → 继续轮询
+    } catch (err) {
+      logger.warn({ userId, err }, 'bytedcli poll error (continuing)');
+    }
+  };
+
+  const timer = setInterval(() => {
+    tick().catch((err) =>
+      logger.warn({ userId, err }, 'bytedcli poll tick crashed'),
+    );
+  }, BYTEDCLI_POLL_INTERVAL_MS);
+  bytedcliPollTimers.set(userId, timer);
+}
+
+async function handleLoginCommand(
+  chatJid: string,
+  senderImId?: string,
+): Promise<string> {
+  if (!senderImId) {
+    return '/login 需要在飞书会话中使用（无法取到你的 open_id）';
+  }
+  const user = getUserByFeishuOpenId(senderImId);
+  if (!user) {
+    return '你的账号还未注册到 happyclaw —— 先发一条普通消息触发 auto-register，再 /login。';
+  }
+  try {
+    const r = await bytedcliBeginAuth(user.id, DATA_DIR);
+    markBytedcliAuthPending(user.id, r.completeToken);
+    startBytedcliAuthPolling(user.id, r.completeToken, chatJid);
+    return [
+      'bytedcli SSO challenge 已生成 ⏳',
+      '',
+      `🔗 扫码 / 点开完成 SSO：${r.qrUrl}`,
+      `📷 QR 图（也可手机扫）：${r.qrImagePath}`,
+      '',
+      '我会每 5s 后台轮询；完成 / 过期都会告诉你（最多等 5min）。',
+    ].join('\n');
+  } catch (err) {
+    logger.error({ userId: user.id, err }, 'bytedcli /login failed to begin');
+    return `bytedcli SSO 启动失败：${(err as Error).message}`;
   }
 }
 
