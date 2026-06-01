@@ -15,7 +15,7 @@
  *
  * 全部 host-side 调用；container 内不跑 bytedcli auth login。
  */
-import { execFile } from 'child_process';
+import { execFile, execFileSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 import { promisify } from 'util';
@@ -23,6 +23,83 @@ import { promisify } from 'util';
 import { logger } from './logger.js';
 
 const execFileAsync = promisify(execFile);
+
+/** site → ByteCloud 域名（jwt_override 文件名 + override host 字段用）。 */
+const SITE_CLOUD_HOST: Record<string, string> = {
+  cn: 'https://cloud.bytedance.net',
+  boe: 'https://cloud.bytedance.net',
+  'i18n-bd': 'https://cloud.bytedance.net',
+  'i18n-tt': 'https://cloud.tiktok-row.net',
+  'eu-ttp': 'https://cloud.tiktok-row.net',
+  'us-ttp': 'https://cloud-ttp-us.bytedance.net',
+};
+
+export interface CredentialJwts {
+  /** Codebase JWT（git 拉 code.byted.org 用，password 位）。 */
+  codebaseJwt: string;
+  /** ByteCloud JWT（容器内 bytedcli 命令 jwt_override 用，可空）。 */
+  bytecloudJwt: string;
+  /** ByteCloud 域名（如 https://cloud.bytedance.net），jwt_override 文件名用。 */
+  cloudHost: string;
+}
+
+/** 从 bytedcli --json 多行输出取最后一个 status 结果行的 data.jwt。 */
+function parseJwtFromOutput(stdout: string): string {
+  const lines = stdout.split('\n').map((l) => l.trim()).filter(Boolean);
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (!lines[i].startsWith('{')) continue;
+    try {
+      const d = JSON.parse(lines[i]) as Record<string, unknown>;
+      if (typeof d.status === 'string') {
+        const data = (d.data as Record<string, unknown>) || {};
+        const jwt = data.jwt ?? data.token;
+        return typeof jwt === 'string' ? jwt : '';
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+  return '';
+}
+
+/**
+ * host 端同步拿 codebase + bytecloud JWT（从 sourceHome 的已认证凭证转）。
+ * 容器内用不了 mount 的加密凭证（device key 死路），但 JWT 自包含可注入。
+ * sourceHome 必须是 host 上某个 ByteCloud Auth 已 authed 的 HOME（operator 默认 home /
+ * 或 per-user sandbox）；host 有 macOS device key 能解密任意 HOME 的凭证。
+ *
+ * @returns null 当 sourceHome 未认证 / 取 JWT 失败（codebaseJwt 必须非空才返回）
+ */
+export function fetchCredentialJwts(sourceHome: string): CredentialJwts | null {
+  const site = bytedcliSite();
+  const env: NodeJS.ProcessEnv = { ...process.env, HOME: sourceHome };
+  const run = (sub: string): string => {
+    try {
+      const out = execFileSync(
+        bytedcliBin(),
+        ['--site', site, 'auth', sub, '--json'],
+        { env, timeout: 15_000, maxBuffer: 1024 * 1024 },
+      ).toString();
+      return parseJwtFromOutput(out);
+    } catch (err) {
+      const e = err as { stdout?: Buffer | string };
+      if (e.stdout) return parseJwtFromOutput(e.stdout.toString());
+      return '';
+    }
+  };
+
+  const codebaseJwt = run('get-codebase-jwt-token');
+  if (!codebaseJwt) {
+    logger.warn({ sourceHome, site }, 'fetchCredentialJwts: no codebase JWT (source not authed?)');
+    return null;
+  }
+  const bytecloudJwt = run('get-bytecloud-jwt-token');
+  return {
+    codebaseJwt,
+    bytecloudJwt,
+    cloudHost: SITE_CLOUD_HOST[site] ?? 'https://cloud.bytedance.net',
+  };
+}
 
 /** Per-user sandbox HOME root，bytedcli 数据隔离锚点。 */
 export function getUserBytedcliSandbox(userId: string, dataDir: string): string {
