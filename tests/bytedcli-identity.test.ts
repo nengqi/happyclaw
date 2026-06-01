@@ -56,9 +56,9 @@ const OWNER = 'user-abc';
 const savedEnv = { ...process.env };
 
 const mountRoot = () => path.join(dataDir, 'config', 'user-cli', OWNER, 'bytedcli-mount');
-const gitCreds = () => path.join(mountRoot(), '.git-credentials');
-const gitconfig = () => path.join(mountRoot(), '.gitconfig');
 const dataDirPath = () => path.join(mountRoot(), 'data');
+const gitCreds = () => path.join(dataDirPath(), '.git-credentials'); // 移到 rw data 目录内
+const gitconfig = () => path.join(mountRoot(), '.gitconfig');
 
 beforeEach(() => {
   tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'bytedcli-id-test-'));
@@ -99,8 +99,10 @@ describe('ensureBytedcliIdentity — JWT-based', () => {
     // .git-credentials 含 codebase jwt
     const creds = fs.readFileSync(gitCreds(), 'utf8');
     expect(creds).toContain('x-jwt-token:CB_JWT@code.byted.org');
-    // .gitconfig helper=store
-    expect(fs.readFileSync(gitconfig(), 'utf8')).toContain('helper = store');
+    // .gitconfig helper=store --file 指向 rw data 目录（避免 ro 写回 warning）
+    const gc = fs.readFileSync(gitconfig(), 'utf8');
+    expect(gc).toContain('helper = store --file=');
+    expect(gc).toContain('/.git-credentials');
     // jwt_override 含 bytecloud jwt
     const ov = fs.readFileSync(
       path.join(dataDirPath(), 'jwt_override.cloud.bytedance.net.json'),
@@ -108,9 +110,10 @@ describe('ensureBytedcliIdentity — JWT-based', () => {
     );
     expect(ov).toContain('BC_JWT');
     expect(ov).toContain('https://cloud.bytedance.net');
-    // 返回路径正确
-    expect(r!.hostGitCredentials).toBe(gitCreds());
+    // 返回路径正确（.git-credentials 在 data 目录内，随 data mount 进容器）
+    expect(fs.existsSync(gitCreds())).toBe(true);
     expect(r!.hostDataDir).toBe(dataDirPath());
+    expect(r!.hostGitconfig).toBe(gitconfig());
   });
 
   test('③ fetchCredentialJwts 返 null（源未认证）→ null', () => {

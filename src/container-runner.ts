@@ -47,7 +47,6 @@ import {
   getEffectiveOwnerId,
   CONTAINER_BYTEDCLI_DATA,
   CONTAINER_GITCONFIG,
-  CONTAINER_GIT_CREDENTIALS,
 } from './bytedcli-identity.js';
 import {
   getUserRuntimeRoot,
@@ -699,15 +698,11 @@ export function buildVolumeMounts(
   if (bytedcliOwnerId) {
     const bytedcli = ensureBytedcliIdentity(bytedcliOwnerId, DATA_DIR);
     if (bytedcli) {
+      // data 目录（含 jwt_override + .git-credentials）rw 挂载，让 git store 可写回。
       mounts.push({
         hostPath: bytedcli.hostDataDir,
         containerPath: CONTAINER_BYTEDCLI_DATA,
         readonly: false,
-      });
-      mounts.push({
-        hostPath: bytedcli.hostGitCredentials,
-        containerPath: CONTAINER_GIT_CREDENTIALS,
-        readonly: true,
       });
       mounts.push({
         hostPath: bytedcli.hostGitconfig,

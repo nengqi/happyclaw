@@ -83,20 +83,22 @@ function buildGitCredentials(codebaseJwt: string): string {
   return `https://x-jwt-token:${codebaseJwt}@code.byted.org\n`;
 }
 
-/** .gitconfig：credential.helper=store（从 .git-credentials 读凭证）。 */
+/**
+ * .gitconfig：credential.helper=store 指向容器内 rw data 目录下的 .git-credentials。
+ * 用 --file 显式指向 rw 路径（非默认 ~/.git-credentials），让 git store 能写回，
+ * 避免 ro 单文件 mount 的 "unable to write credential store: Device busy" warning。
+ */
 function buildGitconfig(): string {
   return [
     '[credential]',
-    '\thelper = store',
+    `\thelper = store --file=${CONTAINER_BYTEDCLI_DATA}/.git-credentials`,
     '',
   ].join('\n');
 }
 
 export interface BytedcliIdentityMounts {
-  /** per-user data 目录（含 jwt_override）→ CONTAINER_BYTEDCLI_DATA（rw）。 */
+  /** per-user data 目录（含 jwt_override + .git-credentials）→ CONTAINER_BYTEDCLI_DATA（rw）。 */
   hostDataDir: string;
-  /** .git-credentials → CONTAINER_GIT_CREDENTIALS（ro）。 */
-  hostGitCredentials: string;
   /** .gitconfig → CONTAINER_GITCONFIG（ro）。 */
   hostGitconfig: string;
 }
@@ -177,7 +179,8 @@ export function ensureBytedcliIdentity(
 
   const mountRoot = path.join(dataDir, 'config', 'user-cli', ownerId, 'bytedcli-mount');
   const mountDataDir = path.join(mountRoot, 'data');
-  const gitCredentials = path.join(mountRoot, '.git-credentials');
+  // .git-credentials 放 rw 的 data 目录内（gitconfig helper --file 指向它），git store 可写回。
+  const gitCredentials = path.join(mountDataDir, '.git-credentials');
   const gitconfig = path.join(mountRoot, '.gitconfig');
 
   try {
@@ -211,7 +214,6 @@ export function ensureBytedcliIdentity(
 
   return {
     hostDataDir: mountDataDir,
-    hostGitCredentials: gitCredentials,
     hostGitconfig: gitconfig,
   };
 }
