@@ -21,6 +21,11 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 
+import {
+  getUserBytedcliDataDir,
+  hasAuthedSandbox,
+} from './bytedcli-auth.js';
+import { getUserById } from './db.js';
 import { logger } from './logger.js';
 
 /** 容器内 bytedcli 数据目录（node 用户）。 */
@@ -31,6 +36,35 @@ export const CONTAINER_GITCONFIG = '/home/node/.gitconfig';
 /** 是否开启 bytedcli 身份注入。关闭时容器完全不挂载 bytedcli 相关卷。 */
 export function isBytedcliInjectEnabled(): boolean {
   return process.env.BYTEDCLI_INJECT === 'true';
+}
+
+/**
+ * 是否开启 per-user SSO 模式（authed user 用自己 sandbox，pending/expired 不挂）。
+ * 关 = 沿用 seed-from-operator 兜底（demo 平滑过渡）。
+ */
+export function isPerUserModeEnabled(): boolean {
+  return process.env.BYTEDCLI_PER_USER === 'true';
+}
+
+/**
+ * 从 group 推导真正应该归属的 ownerId（修 created_by bug）：
+ *   member home group 的 folder 是 `home-<userId>` → 直接解析出 userId
+ *   其它情况 fallback 到 group.created_by
+ *
+ * 背景：ensureUserHomeGroup 给 is_home=1 row 写 created_by=memberId，但 IM-bound
+ * is_home=0 兄弟行是别处建的，created_by=admin。container-runner 的 spawn 用
+ * is_home=0 row → 读到 admin，把 bytedcli seed 全往 admin 目录写，所有 member 共享
+ * 同一份 operator 身份，per-user 隔离假性。folder 前缀解析绕开 DB 歧义。
+ */
+export function getEffectiveOwnerId(group: {
+  folder: string;
+  created_by?: string;
+}): string | undefined {
+  if (group.folder.startsWith('home-')) {
+    const candidate = group.folder.slice('home-'.length);
+    if (candidate) return candidate;
+  }
+  return group.created_by;
 }
 
 /** 宿主机 bytedcli 身份数据来源目录（操作者本人的登录态）。 */
@@ -101,7 +135,7 @@ export function ensureBytedcliIdentity(
   const userDataDir = path.join(userRoot, 'data');
   const userGitconfig = path.join(userRoot, 'gitconfig');
 
-  // gitconfig 每次重写（幂等）
+  // gitconfig 每次重写（幂等，per-user / operator-seed 两条路径都要）
   try {
     fs.mkdirSync(userRoot, { recursive: true });
     fs.writeFileSync(userGitconfig, buildGitconfig(), { mode: 0o644 });
@@ -110,6 +144,39 @@ export function ensureBytedcliIdentity(
     return null;
   }
 
+  // Per-user 模式：按 user.bytedcli_auth_status 选数据源（authed=用户自己 sandbox / pending=不挂）
+  if (isPerUserModeEnabled()) {
+    const user = getUserById(ownerId);
+    if (!user) {
+      logger.warn({ ownerId }, 'bytedcli-identity: per-user mode but user row not found, skip mount');
+      return null;
+    }
+    const status = user.bytedcli_auth_status;
+    if (status === 'authed') {
+      if (hasAuthedSandbox(ownerId, dataDir)) {
+        const sandboxData = getUserBytedcliDataDir(ownerId, dataDir);
+        logger.info(
+          { ownerId, sandboxData },
+          'bytedcli-identity: per-user authed, mounting user sandbox',
+        );
+        return { hostDataDir: sandboxData, hostGitconfig: userGitconfig };
+      }
+      logger.warn(
+        { ownerId },
+        'bytedcli-identity: status=authed but sandbox missing — falling back to operator seed',
+      );
+      // fall through to legacy seed-from-operator
+    } else if (status === 'pending' || status === 'expired') {
+      logger.info(
+        { ownerId, status },
+        'bytedcli-identity: per-user pending/expired — skipping mount, user must /login',
+      );
+      return null;
+    }
+    // status === 'none' → fall through to seed-from-operator（首次使用即赠默认身份，UX 平滑）
+  }
+
+  // Legacy / fallback：seed-from-operator（operator 真身份播种到 per-user 目录）
   // seed-once：目录已有内容则跳过播种
   let needSeed = true;
   try {

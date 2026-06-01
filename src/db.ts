@@ -674,6 +674,17 @@ export function initDatabase(): void {
   );
   ensureColumn('users', 'enabled_skills', "TEXT NOT NULL DEFAULT '[]'");
   ensureColumn('users', 'user_secrets', 'TEXT');
+  // Per-user bytedcli SSO state (fork: 多租户 per-user cookie 注入；详 bytedcli-auth.ts）。
+  // 流程：/login → begin → 写 status='pending' + complete_token + QR png → 用户扫码 → 轮询 complete →
+  //       status='authed' → container 挂用户 sandbox 而非 operator seed。
+  ensureColumn(
+    'users',
+    'bytedcli_auth_status',
+    "TEXT NOT NULL DEFAULT 'none'",
+  );
+  ensureColumn('users', 'bytedcli_complete_token', 'TEXT');
+  ensureColumn('users', 'bytedcli_auth_started_at', 'INTEGER');
+  ensureColumn('users', 'bytedcli_authed_at', 'INTEGER');
   ensureColumn('scheduled_tasks', 'created_by', 'TEXT');
   ensureColumn('scheduled_tasks', 'execution_type', "TEXT DEFAULT 'agent'");
   ensureColumn('scheduled_tasks', 'script_command', 'TEXT');
@@ -845,6 +856,10 @@ export function initDatabase(): void {
     'feishu_open_id',
     'enabled_skills',
     'user_secrets',
+    'bytedcli_auth_status',
+    'bytedcli_complete_token',
+    'bytedcli_auth_started_at',
+    'bytedcli_authed_at',
     'created_at',
     'updated_at',
     'last_login_at',
@@ -3282,6 +3297,14 @@ function parseJsonDetails(raw: unknown): Record<string, unknown> | null {
   }
 }
 
+/** Validate bytedcli_auth_status; unknown / missing values fall back to 'none'. */
+function parseBytedcliAuthStatus(
+  raw: unknown,
+): 'none' | 'pending' | 'authed' | 'expired' {
+  if (raw === 'pending' || raw === 'authed' || raw === 'expired') return raw;
+  return 'none';
+}
+
 /** Safely parse the enabled_skills JSON column into a string[] (empty on any error). */
 function parseEnabledSkills(raw: unknown): string[] {
   if (typeof raw !== 'string' || !raw) return [];
@@ -3328,6 +3351,19 @@ function mapUserRow(row: Record<string, unknown>): User {
     feishu_open_id:
       typeof row.feishu_open_id === 'string' ? row.feishu_open_id : null,
     enabled_skills: parseEnabledSkills(row.enabled_skills),
+    bytedcli_auth_status: parseBytedcliAuthStatus(row.bytedcli_auth_status),
+    bytedcli_complete_token:
+      typeof row.bytedcli_complete_token === 'string'
+        ? row.bytedcli_complete_token
+        : null,
+    bytedcli_auth_started_at:
+      typeof row.bytedcli_auth_started_at === 'number'
+        ? row.bytedcli_auth_started_at
+        : null,
+    bytedcli_authed_at:
+      typeof row.bytedcli_authed_at === 'number'
+        ? row.bytedcli_authed_at
+        : null,
     created_at: String(row.created_at),
     updated_at: String(row.updated_at),
     last_login_at:
@@ -3543,6 +3579,53 @@ export function setUserEnabledSkills(userId: string, skills: string[]): void {
     'UPDATE users SET enabled_skills = ?, updated_at = ? WHERE id = ?',
   ).run(JSON.stringify(skills), new Date().toISOString(), userId);
 }
+
+// ── Per-user bytedcli SSO 状态机 helpers ──
+// 状态转移：
+//   none/expired --beginAuth--> pending (+complete_token, +started_at)
+//   pending      --completeAuth--> authed  (+authed_at, 清 complete_token)
+//   pending      --expireAuth (timeout/error)--> expired (清 complete_token)
+//   authed       --expireAuth--> expired（session 过期重新走 /login 时使用）
+
+/** Mark a user as having started SSO; persists the complete_token for polling. */
+export function markBytedcliAuthPending(
+  userId: string,
+  completeToken: string,
+): void {
+  db.prepare(
+    `UPDATE users SET
+       bytedcli_auth_status = 'pending',
+       bytedcli_complete_token = ?,
+       bytedcli_auth_started_at = ?,
+       updated_at = ?
+     WHERE id = ?`,
+  ).run(completeToken, Date.now(), new Date().toISOString(), userId);
+}
+
+/** Mark a user's bytedcli SSO as fully authed; clears the pending token. */
+export function markBytedcliAuthed(userId: string): void {
+  db.prepare(
+    `UPDATE users SET
+       bytedcli_auth_status = 'authed',
+       bytedcli_complete_token = NULL,
+       bytedcli_authed_at = ?,
+       updated_at = ?
+     WHERE id = ?`,
+  ).run(Date.now(), new Date().toISOString(), userId);
+}
+
+/** Mark a user's bytedcli auth as expired/failed; clears the pending token. */
+export function markBytedcliAuthExpired(userId: string): void {
+  db.prepare(
+    `UPDATE users SET
+       bytedcli_auth_status = 'expired',
+       bytedcli_complete_token = NULL,
+       updated_at = ?
+     WHERE id = ?`,
+  ).run(new Date().toISOString(), userId);
+}
+
+// (getUserById 已在 ~L3533 提供；bytedcli-auth.ts / bytedcli-identity.ts 直接复用)
 
 export interface ListUsersOptions {
   query?: string;

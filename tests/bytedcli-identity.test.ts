@@ -20,9 +20,18 @@ vi.mock('../src/logger.js', () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
 }));
 
+// Mock db.ts 整体（避免 import 时初始化 better-sqlite3）。仅暴露 ensureBytedcliIdentity 用到的
+// getUserById；per-user 分支测试直接控制 user.bytedcli_auth_status。
+const mockUserState: { [id: string]: { bytedcli_auth_status: string } } = {};
+vi.mock('../src/db.js', () => ({
+  getUserById: (id: string) => (mockUserState[id] ? { id, ...mockUserState[id] } : undefined),
+}));
+
 import {
   ensureBytedcliIdentity,
   isBytedcliInjectEnabled,
+  isPerUserModeEnabled,
+  getEffectiveOwnerId,
 } from '../src/bytedcli-identity.js';
 
 let tmp: string;
@@ -128,5 +137,95 @@ describe('bytedcli-identity', () => {
     expect(gc).toContain('x-access-token');
     expect(gc).toContain('pat-token-xyz');
     expect(gc).not.toContain('bytedcli auth git-credential-helper');
+  });
+});
+
+describe('getEffectiveOwnerId — 修 created_by 错位 bug', () => {
+  test('member home folder `home-<userId>` 解析出 userId（绕开 IM-bound 行 created_by=admin）', () => {
+    expect(
+      getEffectiveOwnerId({ folder: 'home-0f8e893e-abc', created_by: 'admin-xxx' }),
+    ).toBe('0f8e893e-abc');
+  });
+  test('非 home- 前缀（如 admin folder=main）回落到 group.created_by', () => {
+    expect(getEffectiveOwnerId({ folder: 'main', created_by: 'admin-1' })).toBe('admin-1');
+  });
+  test('home- 前缀但 userId 部分为空 → 回落 created_by', () => {
+    expect(getEffectiveOwnerId({ folder: 'home-', created_by: 'cb' })).toBe('cb');
+  });
+});
+
+describe('ensureBytedcliIdentity — per-user 模式分支', () => {
+  beforeEach(() => {
+    process.env.BYTEDCLI_PER_USER = 'true';
+    for (const k of Object.keys(mockUserState)) delete mockUserState[k];
+  });
+
+  test('flag on + user.status=authed + sandbox 实存 → mount 用户自己 sandbox（非 operator seed）', () => {
+    mockUserState[OWNER] = { bytedcli_auth_status: 'authed' };
+    // 模拟用户自己的 sandbox 完成 SSO 后产生的 bytecloud-auth/ 真实目录
+    const sandboxData = path.join(
+      dataDir,
+      'config',
+      'user-cli',
+      OWNER,
+      'bytedcli-sandbox',
+      '.local',
+      'share',
+      'bytedcli',
+      'data',
+    );
+    fs.mkdirSync(path.join(sandboxData, 'bytecloud-auth'), { recursive: true });
+    seedHost(); // 故意也放 operator data，证明 authed 不取这个
+    const r = ensureBytedcliIdentity(OWNER, dataDir);
+    expect(r).not.toBeNull();
+    expect(r!.hostDataDir).toBe(sandboxData);
+  });
+
+  test('flag on + status=pending → null（不挂载，强制 /login）', () => {
+    mockUserState[OWNER] = { bytedcli_auth_status: 'pending' };
+    seedHost();
+    const r = ensureBytedcliIdentity(OWNER, dataDir);
+    expect(r).toBeNull();
+    // operator-seed 目录不该产生
+    expect(fs.existsSync(userDataDir())).toBe(false);
+  });
+
+  test('flag on + status=expired → null（同 pending）', () => {
+    mockUserState[OWNER] = { bytedcli_auth_status: 'expired' };
+    seedHost();
+    expect(ensureBytedcliIdentity(OWNER, dataDir)).toBeNull();
+  });
+
+  test('flag on + status=none → 落 operator seed 兜底（UX 平滑过渡）', () => {
+    mockUserState[OWNER] = { bytedcli_auth_status: 'none' };
+    seedHost();
+    const r = ensureBytedcliIdentity(OWNER, dataDir);
+    expect(r).not.toBeNull();
+    expect(r!.hostDataDir).toBe(userDataDir());
+  });
+
+  test('flag on + status=authed 但 sandbox 缺失（authed 历史残留）→ 回落 operator seed', () => {
+    mockUserState[OWNER] = { bytedcli_auth_status: 'authed' };
+    // 不建 bytecloud-auth/
+    seedHost();
+    const r = ensureBytedcliIdentity(OWNER, dataDir);
+    expect(r).not.toBeNull();
+    expect(r!.hostDataDir).toBe(userDataDir());
+  });
+
+  test('flag off → 完全不走 per-user 分支，行为同旧版（authed 也走 operator seed）', () => {
+    delete process.env.BYTEDCLI_PER_USER;
+    expect(isPerUserModeEnabled()).toBe(false);
+    mockUserState[OWNER] = { bytedcli_auth_status: 'authed' };
+    seedHost();
+    const r = ensureBytedcliIdentity(OWNER, dataDir);
+    expect(r).not.toBeNull();
+    expect(r!.hostDataDir).toBe(userDataDir());
+  });
+
+  test('flag on + 用户不存在 DB → null（防御性，没用户不挂）', () => {
+    // 不写 mockUserState[OWNER]
+    seedHost();
+    expect(ensureBytedcliIdentity(OWNER, dataDir)).toBeNull();
   });
 });

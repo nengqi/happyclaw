@@ -220,6 +220,15 @@ export interface User {
   feishu_open_id: string | null;
   // enabled_skills: per-user 静态启用 skill 名列表（JSON array），admin 全挂普通用户按子集挂
   enabled_skills: string[];
+  // Per-user bytedcli SSO 状态机（详 bytedcli-auth.ts）：
+  //   none    — 从未发起过 /login（默认；container mount 走 operator seed 兜底）
+  //   pending — 已 begin，等用户扫码 + 后台轮询（container 不挂 bytedcli，提示先 /login）
+  //   authed  — SSO 完成，user 自己的 sandbox 已就位（container mount 走 user sandbox）
+  //   expired — 上次会话过期或 timeout（容器同 pending，需重发 /login）
+  bytedcli_auth_status: 'none' | 'pending' | 'authed' | 'expired';
+  bytedcli_complete_token: string | null;
+  bytedcli_auth_started_at: number | null;
+  bytedcli_authed_at: number | null;
   created_at: string;
   updated_at: string;
   last_login_at: string | null;

@@ -44,6 +44,7 @@ import type { ClaudeProviderConfig } from './runtime-config.js';
 import { loadUserMcpServers } from './mcp-utils.js';
 import {
   ensureBytedcliIdentity,
+  getEffectiveOwnerId,
   CONTAINER_BYTEDCLI_DATA,
   CONTAINER_GITCONFIG,
 } from './bytedcli-identity.js';
@@ -691,8 +692,11 @@ export function buildVolumeMounts(
   // Per-user bytedcli 身份注入（BYTEDCLI_INJECT=true 时）：让 member 容器内能跑
   // bytedcli / 拉 code.byted.org 公司代码。seed 一次操作者身份后，data 目录由容器
   // 自己维护（刷新 JWT），跨对话保留登录态。详见 bytedcli-identity.ts。
-  if (ownerId) {
-    const bytedcli = ensureBytedcliIdentity(ownerId, DATA_DIR);
+  // ownerId 用 getEffectiveOwnerId 取（修 created_by 错位 bug）：member home group
+  // folder=`home-<userId>` 直接解析 memberId，绕开 IM-bound 兄弟行 created_by=admin 的歧义。
+  const bytedcliOwnerId = getEffectiveOwnerId(group);
+  if (bytedcliOwnerId) {
+    const bytedcli = ensureBytedcliIdentity(bytedcliOwnerId, DATA_DIR);
     if (bytedcli) {
       mounts.push({
         hostPath: bytedcli.hostDataDir,
