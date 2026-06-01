@@ -23,10 +23,11 @@ import path from 'path';
 
 import {
   fetchCredentialJwts,
+  ensureCodebasePat,
   getUserBytedcliSandbox,
   hasAuthedSandbox,
 } from './bytedcli-auth.js';
-import { getUserById } from './db.js';
+import { getUserById, getUserCodebasePat, setUserCodebasePat } from './db.js';
 import { logger } from './logger.js';
 
 /** 容器内 bytedcli 数据目录（node 用户），放 jwt_override 文件。 */
@@ -74,13 +75,9 @@ function getOperatorSourceHome(): string {
   return process.env.BYTEDCLI_SOURCE_HOME || os.homedir();
 }
 
-/** code.byted.org git credential（.git-credentials 单行）。 */
-function buildGitCredentials(codebaseJwt: string): string {
-  const pat = process.env.CODEBASE_PAT;
-  if (pat) {
-    return `https://x-access-token:${pat}@code.byted.org\n`;
-  }
-  return `https://x-jwt-token:${codebaseJwt}@code.byted.org\n`;
+/** code.byted.org git credential 单行（PAT 用 x-access-token，JWT 用 x-jwt-token）。 */
+function gitCredLine(username: string, secret: string): string {
+  return `https://${username}:${secret}@code.byted.org\n`;
 }
 
 /**
@@ -158,12 +155,32 @@ export function ensureBytedcliIdentity(
   const sourceHome = resolveSourceHome(ownerId, dataDir);
   if (!sourceHome) return null;
 
-  // CODEBASE_PAT 模式：不依赖 host 认证，直接用 PAT 拼 .git-credentials（仍生成空 data 目录）。
-  const pat = process.env.CODEBASE_PAT;
-  let codebaseJwt = '';
+  // 凭证优先级：① CODEBASE_PAT env（operator 显式 PAT）② per-user 自动 PAT（方案 C）
+  //            ③ JWT 兜底（operator non-per-user / per-user 关）
+  let credLine: string;
   let bytecloudJwt = '';
   let cloudHost = 'https://cloud.bytedance.net';
-  if (!pat) {
+
+  const envPat = process.env.CODEBASE_PAT;
+  if (envPat) {
+    credLine = gitCredLine('x-access-token', envPat);
+  } else if (isPerUserModeEnabled()) {
+    // per-user：自助 create/复用 PAT（长效 90 天，存 DB user_secrets）
+    const existing = getUserCodebasePat(ownerId);
+    const pat = ensureCodebasePat(sourceHome, ownerId, existing);
+    if (!pat) {
+      logger.warn({ ownerId, sourceHome }, 'bytedcli-identity: ensureCodebasePat failed, skip mount');
+      return null;
+    }
+    if (!existing || existing.token !== pat.token) setUserCodebasePat(ownerId, pat);
+    credLine = gitCredLine('x-access-token', pat.token);
+    // 顺带 bytecloud JWT（容器内 bytedcli 命令的 jwt_override，best-effort）
+    const jwts = fetchCredentialJwts(sourceHome);
+    if (jwts) {
+      bytecloudJwt = jwts.bytecloudJwt;
+      cloudHost = jwts.cloudHost;
+    }
+  } else {
     const jwts = fetchCredentialJwts(sourceHome);
     if (!jwts) {
       logger.warn(
@@ -172,7 +189,7 @@ export function ensureBytedcliIdentity(
       );
       return null;
     }
-    codebaseJwt = jwts.codebaseJwt;
+    credLine = gitCredLine('x-jwt-token', jwts.codebaseJwt);
     bytecloudJwt = jwts.bytecloudJwt;
     cloudHost = jwts.cloudHost;
   }
@@ -185,8 +202,8 @@ export function ensureBytedcliIdentity(
 
   try {
     fs.mkdirSync(mountDataDir, { recursive: true });
-    // git 凭证（每轮 fresh）
-    fs.writeFileSync(gitCredentials, buildGitCredentials(codebaseJwt), { mode: 0o644 });
+    // git 凭证（PAT 长效复用 / JWT 每轮 fresh）
+    fs.writeFileSync(gitCredentials, credLine, { mode: 0o644 });
     fs.writeFileSync(gitconfig, buildGitconfig(), { mode: 0o644 });
     // bytecloud JWT override（供容器内 bytedcli 命令；git 不需要它）
     if (bytecloudJwt) {
@@ -207,8 +224,9 @@ export function ensureBytedcliIdentity(
     return null;
   }
 
+  const credMode = envPat ? 'env-pat' : isPerUserModeEnabled() ? 'per-user-pat' : 'jwt';
   logger.info(
-    { ownerId, sourceHome, mode: pat ? 'pat' : 'jwt' },
+    { ownerId, sourceHome, credMode },
     'bytedcli-identity: credentials prepared (git + jwt_override)',
   );
 

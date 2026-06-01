@@ -62,6 +62,100 @@ function parseJwtFromOutput(stdout: string): string {
   return '';
 }
 
+/** 从 bytedcli --json 多行输出取最后一个 status 结果行的 data 对象。 */
+function parseDataFromOutput(stdout: string): Record<string, unknown> | null {
+  const lines = stdout.split('\n').map((l) => l.trim()).filter(Boolean);
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (!lines[i].startsWith('{')) continue;
+    try {
+      const d = JSON.parse(lines[i]) as Record<string, unknown>;
+      if (typeof d.status === 'string') return (d.data as Record<string, unknown>) ?? null;
+    } catch {
+      /* ignore */
+    }
+  }
+  return null;
+}
+
+export interface CodebasePat {
+  token: string;
+  id: string;
+  expires_at: string;
+}
+
+/**
+ * 确保 user 有有效的 Codebase PAT（自助 `codebase pat create`，方案 C）。
+ * 有效（未过期 + 离过期 >1 天）→ 复用 existing；否则 create 新的（先删旧 id 避免累积）。
+ * PAT 是 sourceHome 认证用户的身份（per-user sandbox → 该用户；operator HOME → operator）。
+ *
+ * @param sourceHome  已认证的 bytedcli HOME
+ * @param userId      happyclaw user id（PAT 命名 happyclaw-<userId>）
+ * @param existing    DB 已存的 PAT（复用判断）
+ * @returns 有效 PAT，或 null（create 失败）
+ */
+export function ensureCodebasePat(
+  sourceHome: string,
+  userId: string,
+  existing: CodebasePat | null,
+): CodebasePat | null {
+  const RENEW_BUFFER_MS = 24 * 60 * 60 * 1000; // 离过期 <1 天就重建
+  if (existing?.token && existing.expires_at) {
+    const exp = new Date(existing.expires_at).getTime();
+    if (!Number.isNaN(exp) && exp - Date.now() > RENEW_BUFFER_MS) {
+      return existing; // 复用
+    }
+  }
+
+  const site = bytedcliSite();
+  const env: NodeJS.ProcessEnv = { ...process.env, HOME: sourceHome };
+
+  // 删旧 PAT（过期重建时，避免 happyclaw-<userId> 累积）
+  if (existing?.id) {
+    try {
+      execFileSync(
+        bytedcliBin(),
+        ['--site', site, 'codebase', 'pat', 'delete', '--id', existing.id, '--json'],
+        { env, timeout: 15_000, maxBuffer: 1024 * 1024 },
+      );
+    } catch {
+      /* 旧 PAT 可能已不存在，忽略 */
+    }
+  }
+
+  try {
+    const out = execFileSync(
+      bytedcliBin(),
+      [
+        '--site',
+        site,
+        'codebase',
+        'pat',
+        'create',
+        '--name',
+        `happyclaw-${userId}`,
+        '--scopes',
+        'repo.content:read,repo:download',
+        '--json',
+      ],
+      { env, timeout: 20_000, maxBuffer: 1024 * 1024 },
+    ).toString();
+    const data = parseDataFromOutput(out);
+    const token = typeof data?.token === 'string' ? data.token : '';
+    const pab = data?.personal_access_token as { Id?: string; id?: string } | undefined;
+    const id = pab?.Id ?? pab?.id ?? '';
+    const expires_at = typeof data?.expires_at === 'string' ? data.expires_at : '';
+    if (!token) {
+      logger.warn({ userId, sourceHome }, 'ensureCodebasePat: create returned no token');
+      return null;
+    }
+    logger.info({ userId, patId: id, expires_at }, 'ensureCodebasePat: created new PAT');
+    return { token, id, expires_at };
+  } catch (err) {
+    logger.warn({ userId, err }, 'ensureCodebasePat: create failed');
+    return null;
+  }
+}
+
 /**
  * host 端同步拿 codebase + bytecloud JWT（从 sourceHome 的已认证凭证转）。
  * 容器内用不了 mount 的加密凭证（device key 死路），但 JWT 自包含可注入。

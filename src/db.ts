@@ -3580,6 +3580,47 @@ export function setUserEnabledSkills(userId: string, skills: string[]): void {
   ).run(JSON.stringify(skills), new Date().toISOString(), userId);
 }
 
+// ── Per-user Codebase PAT（user_secrets.codebase_pat）──
+// 自助 `bytedcli codebase pat create` 拿的长效 PAT（90 天），存 DB 复用，过期重建。
+// demo 阶段 plain text 存（DB 文件权限保护）；合规要求出现时再上 AES（见 research）。
+export interface CodebasePatRecord {
+  token: string;
+  id: string;
+  expires_at: string;
+}
+
+/** 读 user 的 codebase PAT（user_secrets JSON 的 codebase_pat 字段），无则 null。 */
+export function getUserCodebasePat(userId: string): CodebasePatRecord | null {
+  const row = db
+    .prepare('SELECT user_secrets FROM users WHERE id = ?')
+    .get(userId) as { user_secrets?: string } | undefined;
+  if (!row?.user_secrets) return null;
+  try {
+    const secrets = JSON.parse(row.user_secrets) as Record<string, unknown>;
+    const pat = secrets.codebase_pat as CodebasePatRecord | undefined;
+    return pat?.token ? pat : null;
+  } catch {
+    return null;
+  }
+}
+
+/** 写 user 的 codebase PAT（merge 进 user_secrets，不动其它字段）。 */
+export function setUserCodebasePat(userId: string, pat: CodebasePatRecord): void {
+  const row = db
+    .prepare('SELECT user_secrets FROM users WHERE id = ?')
+    .get(userId) as { user_secrets?: string } | undefined;
+  let secrets: Record<string, unknown> = {};
+  try {
+    if (row?.user_secrets) secrets = JSON.parse(row.user_secrets);
+  } catch {
+    /* corrupt → overwrite */
+  }
+  secrets.codebase_pat = pat;
+  db.prepare(
+    'UPDATE users SET user_secrets = ?, updated_at = ? WHERE id = ?',
+  ).run(JSON.stringify(secrets), new Date().toISOString(), userId);
+}
+
 // ── Per-user bytedcli SSO 状态机 helpers ──
 // 状态转移：
 //   none/expired --beginAuth--> pending (+complete_token, +started_at)
