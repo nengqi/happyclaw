@@ -47,7 +47,7 @@ JWT_JSON="$(bytedcli --site "$SITE" auth get-bytecloud-jwt-token --json 2>/dev/n
 
 # 4) 解析 + 探测 happyclaw 主机 IP + 回传（python3 一把梭，JSON 处理稳）
 say "回传凭证到 happyclaw..."
-PAT_JSON="$PAT_JSON" JWT_JSON="$JWT_JSON" NONCE="$NONCE" PORT="$PORT" \
+PAT_JSON="$PAT_JSON" JWT_JSON="$JWT_JSON" NONCE="$NONCE" PORT="$PORT" SITE="$SITE" \
   MACMINI_IP="${MACMINI_IP:-}" IPS_URL="$IPS_URL" python3 - <<'PY'
 import json, os, sys, urllib.request, urllib.error
 
@@ -64,15 +64,26 @@ def parse_last_json(s):
 
 pat_raw = parse_last_json(os.environ.get("PAT_JSON", ""))
 jwt_raw = parse_last_json(os.environ.get("JWT_JSON", ""))
-pat_data = pat_raw.get("data", pat_raw) if isinstance(pat_raw, dict) else {}
-jwt_data = jwt_raw.get("data", jwt_raw) if isinstance(jwt_raw, dict) else {}
+# data 可能为 null（create 瞬时失败）→ or 回落 raw dict，下面 token 取空再统一报错
+pat_data = (pat_raw.get("data") or pat_raw) if isinstance(pat_raw, dict) else {}
+jwt_data = (jwt_raw.get("data") or jwt_raw) if isinstance(jwt_raw, dict) else {}
+if not isinstance(pat_data, dict):
+    pat_data = {}
+if not isinstance(jwt_data, dict):
+    jwt_data = {}
 
+# PAT 在 data.token；JWT 在 data.jwt（不是 data.token）；host 输出里没有 → 按 site 推导
+SITE_HOST = {
+    "cn": "https://cloud.bytedance.net", "boe": "https://cloud.bytedance.net",
+    "i18n-bd": "https://cloud.bytedance.net", "i18n-tt": "https://cloud.tiktok-row.net",
+    "eu-ttp": "https://cloud.tiktok-row.net", "us-ttp": "https://cloud-ttp-us.bytedance.net",
+}
 pat = pat_data.get("token", "") if isinstance(pat_data, dict) else ""
 pab = (pat_data.get("personal_access_token") or {}) if isinstance(pat_data, dict) else {}
 pat_id = pab.get("Id") or pab.get("id") or ""
 pat_exp = pat_data.get("expires_at", "") if isinstance(pat_data, dict) else ""
-jwt = jwt_data.get("token", "") if isinstance(jwt_data, dict) else ""
-host = jwt_data.get("host", "") if isinstance(jwt_data, dict) else ""
+jwt = (jwt_data.get("jwt") or jwt_data.get("token") or "") if isinstance(jwt_data, dict) else ""
+host = SITE_HOST.get(os.environ.get("SITE", ""), "")
 
 if not pat and not jwt:
     sys.exit("✗ 没拿到 PAT 或 JWT（bytedcli 输出异常，重跑或检查登录态）")
