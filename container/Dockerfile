@@ -142,9 +142,10 @@ RUN set -e && \
 # 仅在运行时 BYTEDCLI_INJECT=true 且挂载了身份后才有意义（见 bytedcli-identity.ts）。
 # 包从 bnpm 内部源拉 → 构建时需 corplink/内网。best-effort：无内网环境构建也不应失败，
 # 缺失时容器仅不含 bytedcli（功能降级，不影响其它能力）。
-RUN npm config set @bytedance-dev:registry https://bnpm.byted.org \
-    && npm config set @byted:registry https://bnpm.byted.org \
-    && ( npm install -g @bytedance-dev/bytedcli && bytedcli --version ) \
+# 装 bytedcli：所有 deps 走 bnpm（含未 scoped 的内部包 byted-tea-sdk，npmjs.org 没有）。
+# 实测 setup-log：`npm i -g @bytedance-dev/bytedcli --registry bnpm` 单次拉默认源走 bnpm 才能解依赖链。
+RUN ( npm install -g @bytedance-dev/bytedcli --registry https://bnpm.byted.org \
+      && bytedcli --version ) \
     || echo "WARN: bytedcli 安装失败（bnpm 不可达？），容器将不含 bytedcli"
 
 # Copy source code
