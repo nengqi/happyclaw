@@ -1430,13 +1430,30 @@ async function handleLoginCommand(
     const r = await bytedcliBeginAuth(user.id, DATA_DIR);
     markBytedcliAuthPending(user.id, r.completeToken);
     startBytedcliAuthPolling(user.id, r.completeToken, chatJid);
+
+    // Phase 3：把 QR 图直接推到飞书（image 消息），让用户在飞书里点开扫码，
+    // 比贴 SSO URL 让用户复制更直观。失败不挡——下面的 text 已含 URL 作 fallback。
+    try {
+      const qrBuffer = await fs.promises.readFile(r.qrImagePath);
+      await imManager.sendImage(
+        chatJid,
+        qrBuffer,
+        'image/png',
+        'bytedcli SSO QR — 用 Feishu app 直接扫这张图，或点下面 URL',
+      );
+    } catch (imgErr) {
+      logger.warn(
+        { userId: user.id, qrPath: r.qrImagePath, err: imgErr },
+        'bytedcli /login: failed to push QR image (text URL fallback works)',
+      );
+    }
+
     return [
       'bytedcli SSO challenge 已生成 ⏳',
       '',
       `🔗 扫码 / 点开完成 SSO：${r.qrUrl}`,
-      `📷 QR 图（也可手机扫）：${r.qrImagePath}`,
       '',
-      '我会每 5s 后台轮询；完成 / 过期都会告诉你（最多等 5min）。',
+      '我每 5s 后台轮询；完成 / 过期都会告诉你（最多等 5min）。',
     ].join('\n');
   } catch (err) {
     logger.error({ userId: user.id, err }, 'bytedcli /login failed to begin');
