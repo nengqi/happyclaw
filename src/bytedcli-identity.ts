@@ -1,19 +1,25 @@
 /**
- * bytedcli 身份注入（多租户沙盒）——JWT-based。
+ * bytedcli 身份注入（多租户沙盒）——回传 PAT/JWT based（B 方案）。
  *
  * 让容器内能用真人身份跑 bytedcli / git 拉 code.byted.org。
  *
  * ★ 关键约束（2026-06-01 实测）：bytedcli 凭证文件用机器级 device key（macOS
  *   keychain）加密，**裸 mount 凭证文件进 linux 容器解不开**（authenticated:False）。
- *   唯一活路 = JWT 注入：JWT 自包含不依赖 device key。
+ *   唯一活路 = 注入自包含凭证（PAT / JWT，不依赖 device key）。
  *
- * 架构：
- *   1. host 持已认证凭证（operator 默认 HOME / per-user sandbox HOME），host 有 device
- *      key 能解密 → 同步 `get-codebase-jwt-token` + `get-bytecloud-jwt-token` 拿 fresh JWT
- *   2. 在 per-user mount 目录生成：
- *      - .git-credentials（`https://x-jwt-token:<codebase-jwt>@code.byted.org`）+ .gitconfig（helper=store）→ git 拉代码
- *      - data/jwt_override.cloud.<host>.json（bytecloud JWT）→ 容器内 bytedcli 命令
- *   3. mount 进容器；JWT 短效，每轮 spawn 重新生成
+ * 身份来源（per-user 模式）：
+ *   - authed：同事本机跑 login.sh 自己身份登录 → 拿 codebase PAT + bytecloud JWT
+ *     → POST 回 /bytedcli/upload 存 DB（user_secrets.codebase_pat / bytecloud_jwt）。
+ *     这里直接读 DB 写凭证文件 → 真 per-user 身份。
+ *   - none：operator 兜底（首次体验赠默认身份）——走 operator HOME 的短效 codebase
+ *     JWT，**不落任何 per-user 凭证**（避免 operator 凭证污染用户记录）。
+ *   - pending/expired：null（不挂，强制 /login）。
+ *   非 per-user / CODEBASE_PAT env：operator 单身份。
+ *
+ * 文件：
+ *   - .git-credentials（`https://x-access-token:<pat>@...` 或 `x-jwt-token:<jwt>`）
+ *     + .gitconfig（helper=store --file）→ git 拉代码
+ *   - data/jwt_override.cloud.<host>.json（bytecloud JWT）→ 容器内 bytedcli 命令
  *
  * 全部行为由 BYTEDCLI_INJECT=true 门控；未开启时不挂载，容器行为不变。
  */
@@ -21,13 +27,14 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 
+import { fetchCredentialJwts } from './bytedcli-auth.js';
 import {
-  fetchCredentialJwts,
-  ensureCodebasePat,
-  getUserBytedcliSandbox,
-  hasAuthedSandbox,
-} from './bytedcli-auth.js';
-import { getUserById, getUserCodebasePat, setUserCodebasePat } from './db.js';
+  getUserById,
+  getUserCodebasePat,
+  getUserBytecloudJwt,
+  type BytecloudJwtRecord,
+  type CodebasePatRecord,
+} from './db.js';
 import { logger } from './logger.js';
 
 /** 容器内 bytedcli 数据目录（node 用户），放 jwt_override 文件。 */
@@ -43,8 +50,8 @@ export function isBytedcliInjectEnabled(): boolean {
 }
 
 /**
- * 是否开启 per-user SSO 模式（authed user 用自己 sandbox，pending/expired 不挂）。
- * 关 = 用 operator 单身份（demo / D fallback）。
+ * 是否开启 per-user 身份模式（authed user 用自己回传的凭证，none 用 operator 兜底，
+ * pending/expired 不挂）。关 = operator 单身份（demo / fallback）。
  */
 export function isPerUserModeEnabled(): boolean {
   return process.env.BYTEDCLI_PER_USER === 'true';
@@ -68,7 +75,7 @@ export function getEffectiveOwnerId(group: {
 }
 
 /**
- * operator 凭证来源 HOME（非 per-user 模式 / per-user status=none 时用）。
+ * operator 凭证来源 HOME（非 per-user 模式 / per-user status=none 兜底时用）。
  * 默认 os.homedir()（部署 happyclaw 的人本人的 ByteCloud Auth 登录态）。
  */
 function getOperatorSourceHome(): string {
@@ -100,50 +107,54 @@ export interface BytedcliIdentityMounts {
   hostGitconfig: string;
 }
 
-/**
- * 解析凭证来源 HOME：
- *   per-user 模式：authed+sandbox 存在 → sandbox HOME；pending/expired → null（强制 /login）；
- *                  none → operator HOME（首次使用赠默认身份，UX 平滑）
- *   非 per-user：operator HOME
- * @returns sourceHome 或 null（不应注入）
- */
-function resolveSourceHome(ownerId: string, dataDir: string): string | null {
-  if (!isPerUserModeEnabled()) return getOperatorSourceHome();
+type PerUserCredential =
+  | { mode: 'skip' }
+  | { mode: 'operator' }
+  | { mode: 'authed'; pat: CodebasePatRecord; jwt: BytecloudJwtRecord | null };
 
+/**
+ * per-user 模式下决定该 owner 用什么凭证：
+ *   authed + 有回传 PAT → 用户自己的凭证；authed 但无回传 PAT → skip（强制 /login，
+ *     不静默回落 operator 破坏隔离）；pending/expired → skip；none → operator 兜底。
+ */
+function resolvePerUserCredential(ownerId: string): PerUserCredential {
   const user = getUserById(ownerId);
   if (!user) {
     logger.warn({ ownerId }, 'bytedcli-identity: per-user mode but user row not found, skip');
-    return null;
+    return { mode: 'skip' };
   }
   const status = user.bytedcli_auth_status;
   if (status === 'authed') {
-    if (hasAuthedSandbox(ownerId, dataDir)) {
-      return getUserBytedcliSandbox(ownerId, dataDir);
+    const pat = getUserCodebasePat(ownerId);
+    if (!pat?.token) {
+      logger.warn(
+        { ownerId },
+        'bytedcli-identity: status=authed but no uploaded PAT — force /login (no operator fallback)',
+      );
+      return { mode: 'skip' };
     }
-    logger.warn(
-      { ownerId },
-      'bytedcli-identity: status=authed but sandbox missing — falling back to operator',
-    );
-    return getOperatorSourceHome();
+    return { mode: 'authed', pat, jwt: getUserBytecloudJwt(ownerId) };
   }
   if (status === 'pending' || status === 'expired') {
     logger.info(
       { ownerId, status },
       'bytedcli-identity: per-user pending/expired — skip mount, user must /login',
     );
-    return null;
+    return { mode: 'skip' };
   }
   // none → operator 兜底
-  return getOperatorSourceHome();
+  return { mode: 'operator' };
 }
 
 /**
- * 确保容器 bytedcli 身份就位（JWT-based），返回挂载路径。
- * 每轮 spawn 调一次：host 同步拿 fresh JWT → 写 .git-credentials + jwt_override → mount。
+ * 确保容器 bytedcli 身份就位，返回挂载路径。每轮 spawn 调一次。
+ *
+ * 凭证优先级：① CODEBASE_PAT env（operator 显式 PAT）② per-user 回传凭证（authed）/
+ *            operator 兜底（none）③ 非 per-user operator JWT 单身份。
  *
  * @param ownerId  happyclaw user id（经 getEffectiveOwnerId 解析）
  * @param dataDir  happyclaw DATA_DIR
- * @returns 挂载路径，或 null（未开启 / 源未认证 / per-user pending）
+ * @returns 挂载路径，或 null（未开启 / 源未认证 / per-user skip）
  */
 export function ensureBytedcliIdentity(
   ownerId: string,
@@ -152,46 +163,61 @@ export function ensureBytedcliIdentity(
   if (!isBytedcliInjectEnabled()) return null;
   if (!ownerId) return null;
 
-  const sourceHome = resolveSourceHome(ownerId, dataDir);
-  if (!sourceHome) return null;
-
-  // 凭证优先级：① CODEBASE_PAT env（operator 显式 PAT）② per-user 自动 PAT（方案 C）
-  //            ③ JWT 兜底（operator non-per-user / per-user 关）
   let credLine: string;
   let bytecloudJwt = '';
   let cloudHost = 'https://cloud.bytedance.net';
+  let credMode: string;
 
   const envPat = process.env.CODEBASE_PAT;
   if (envPat) {
+    // operator 显式 PAT（demo / 单身份）；顺带 operator bytecloud JWT（best-effort）
     credLine = gitCredLine('x-access-token', envPat);
-  } else if (isPerUserModeEnabled()) {
-    // per-user：自助 create/复用 PAT（长效 90 天，存 DB user_secrets）
-    const existing = getUserCodebasePat(ownerId);
-    const pat = ensureCodebasePat(sourceHome, ownerId, existing);
-    if (!pat) {
-      logger.warn({ ownerId, sourceHome }, 'bytedcli-identity: ensureCodebasePat failed, skip mount');
-      return null;
-    }
-    if (!existing || existing.token !== pat.token) setUserCodebasePat(ownerId, pat);
-    credLine = gitCredLine('x-access-token', pat.token);
-    // 顺带 bytecloud JWT（容器内 bytedcli 命令的 jwt_override，best-effort）
-    const jwts = fetchCredentialJwts(sourceHome);
+    const jwts = fetchCredentialJwts(getOperatorSourceHome());
     if (jwts) {
       bytecloudJwt = jwts.bytecloudJwt;
       cloudHost = jwts.cloudHost;
     }
+    credMode = 'env-pat';
+  } else if (isPerUserModeEnabled()) {
+    const cred = resolvePerUserCredential(ownerId);
+    if (cred.mode === 'skip') return null;
+    if (cred.mode === 'authed') {
+      // 用户自己回传的凭证（真 per-user 身份）
+      credLine = gitCredLine('x-access-token', cred.pat.token);
+      if (cred.jwt) {
+        bytecloudJwt = cred.jwt.token;
+        cloudHost = cred.jwt.host || cloudHost;
+      }
+      credMode = 'per-user-pat';
+    } else {
+      // operator 兜底（status=none）：operator JWT 路径，不落任何 per-user 凭证（rv #1 防污染）
+      const jwts = fetchCredentialJwts(getOperatorSourceHome());
+      if (!jwts) {
+        logger.warn(
+          { ownerId },
+          'bytedcli-identity: operator fallback but operator not authed, skip',
+        );
+        return null;
+      }
+      credLine = gitCredLine('x-jwt-token', jwts.codebaseJwt);
+      bytecloudJwt = jwts.bytecloudJwt;
+      cloudHost = jwts.cloudHost;
+      credMode = 'operator-jwt';
+    }
   } else {
-    const jwts = fetchCredentialJwts(sourceHome);
+    // 非 per-user：operator JWT 单身份
+    const jwts = fetchCredentialJwts(getOperatorSourceHome());
     if (!jwts) {
       logger.warn(
-        { ownerId, sourceHome },
-        'bytedcli-identity: fetchCredentialJwts failed (source not authed), skip mount',
+        { ownerId },
+        'bytedcli-identity: fetchCredentialJwts failed (operator not authed), skip mount',
       );
       return null;
     }
     credLine = gitCredLine('x-jwt-token', jwts.codebaseJwt);
     bytecloudJwt = jwts.bytecloudJwt;
     cloudHost = jwts.cloudHost;
+    credMode = 'operator-jwt';
   }
 
   const mountRoot = path.join(dataDir, 'config', 'user-cli', ownerId, 'bytedcli-mount');
@@ -202,9 +228,22 @@ export function ensureBytedcliIdentity(
 
   try {
     fs.mkdirSync(mountDataDir, { recursive: true });
-    // git 凭证（PAT 长效复用 / JWT 每轮 fresh）
-    fs.writeFileSync(gitCredentials, credLine, { mode: 0o644 });
+    // git 凭证（PAT 长效复用 / JWT 每轮 fresh）——含明文 secret，0600 + chmod 兜旧文件权限
+    // （writeFileSync 的 mode 对已存在文件不一定改旧权限；共享机器上别 world-readable）。
+    fs.writeFileSync(gitCredentials, credLine, { mode: 0o600 });
+    fs.chmodSync(gitCredentials, 0o600);
     fs.writeFileSync(gitconfig, buildGitconfig(), { mode: 0o644 });
+    // 清上一轮残留 jwt_override（mountDataDir 跨 spawn 稳定；旧 host/旧身份 override 不清
+    // 会被容器继续用 → 身份串台 / stale JWT）。.git-credentials 不匹配此 glob，安全。
+    for (const f of fs.readdirSync(mountDataDir)) {
+      if (f.startsWith('jwt_override.') && f.endsWith('.json')) {
+        try {
+          fs.unlinkSync(path.join(mountDataDir, f));
+        } catch {
+          /* ignore */
+        }
+      }
+    }
     // bytecloud JWT override（供容器内 bytedcli 命令；git 不需要它）
     if (bytecloudJwt) {
       const host = cloudHost.replace(/^https?:\/\//, '');
@@ -216,17 +255,17 @@ export function ensureBytedcliIdentity(
           host: cloudHost,
           saved_at: new Date().toISOString(),
         }) + '\n',
-        { mode: 0o644 },
+        { mode: 0o600 },
       );
+      fs.chmodSync(overrideFile, 0o600);
     }
   } catch (err) {
     logger.warn({ ownerId, err }, 'bytedcli-identity: failed to write credential files');
     return null;
   }
 
-  const credMode = envPat ? 'env-pat' : isPerUserModeEnabled() ? 'per-user-pat' : 'jwt';
   logger.info(
-    { ownerId, sourceHome, credMode },
+    { ownerId, credMode },
     'bytedcli-identity: credentials prepared (git + jwt_override)',
   );
 

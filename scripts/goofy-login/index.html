@@ -1,0 +1,16 @@
+<!DOCTYPE html>
+<meta charset="utf-8">
+<title>happyclaw bytedcli 身份授权</title>
+<style>
+  body{font-family:-apple-system,BlinkMacSystemFont,monospace;max-width:680px;margin:3em auto;padding:0 1.5em;line-height:1.7;color:#222}
+  h1{font-size:1.3em}
+  code,pre{background:#f4f4f4;border-radius:6px}
+  pre{padding:1em;overflow-x:auto;border-left:3px solid #3370ff}
+  .note{color:#666;font-size:.9em}
+</style>
+<h1>happyclaw · bytedcli 身份授权</h1>
+<p>在飞书里对机器人发 <code>/login</code>，会拿到一行带你专属 nonce 的命令，形如：</p>
+<pre>curl -fsSL https://bytedcli-login.gf-preview.bytedance.net/login.sh | bash -s -- &lt;nonce&gt;</pre>
+<p>在你<strong>本机终端</strong>粘贴运行：脚本会用你本人身份登录 bytedcli、自助创建 codebase
+PAT、并把凭证<strong>自动回传</strong>给 happyclaw。全程密钥不进飞书对话。</p>
+<p class="note">脚本源码：<code>scripts/goofy-login/login.sh</code>。仅办公网可访问。</p>

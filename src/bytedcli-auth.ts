@@ -109,19 +109,9 @@ export function ensureCodebasePat(
   const site = bytedcliSite();
   const env: NodeJS.ProcessEnv = { ...process.env, HOME: sourceHome };
 
-  // 删旧 PAT（过期重建时，避免 happyclaw-<userId> 累积）
-  if (existing?.id) {
-    try {
-      execFileSync(
-        bytedcliBin(),
-        ['--site', site, 'codebase', 'pat', 'delete', '--id', existing.id, '--json'],
-        { env, timeout: 15_000, maxBuffer: 1024 * 1024 },
-      );
-    } catch {
-      /* 旧 PAT 可能已不存在，忽略 */
-    }
-  }
-
+  // 先 create 新 PAT，成功后再 best-effort 删旧（先删后建会把仍有效的旧 PAT 误废，
+  // create 一旦失败本轮就没凭证了 → rv #5）。
+  let created: CodebasePat | null = null;
   try {
     const out = execFileSync(
       bytedcliBin(),
@@ -146,16 +136,43 @@ export function ensureCodebasePat(
     const pab = data?.personal_access_token as { Id?: string; id?: string } | undefined;
     const id = pab?.Id ?? pab?.id ?? '';
     const expires_at = typeof data?.expires_at === 'string' ? data.expires_at : '';
-    if (!token) {
+    if (token) {
+      created = { token, id, expires_at };
+      logger.info({ userId, patId: id, expires_at }, 'ensureCodebasePat: created new PAT');
+    } else {
       logger.warn({ userId, sourceHome }, 'ensureCodebasePat: create returned no token');
-      return null;
     }
-    logger.info({ userId, patId: id, expires_at }, 'ensureCodebasePat: created new PAT');
-    return { token, id, expires_at };
   } catch (err) {
     logger.warn({ userId, err }, 'ensureCodebasePat: create failed');
-    return null;
   }
+
+  if (!created) {
+    // create 挂了：旧 PAT 只要还没真过期就继续用（降级），别让本轮无凭证。
+    return reuseIfValid(existing);
+  }
+
+  // 新 PAT 到手才删旧（id 不同才删，避免误删刚建的）。
+  if (existing?.id && existing.id !== created.id) {
+    try {
+      execFileSync(
+        bytedcliBin(),
+        ['--site', site, 'codebase', 'pat', 'delete', '--id', existing.id, '--json'],
+        { env, timeout: 15_000, maxBuffer: 1024 * 1024 },
+      );
+    } catch {
+      /* 旧 PAT 可能已不存在，忽略 */
+    }
+  }
+  return created;
+}
+
+/** create 失败时降级：旧 PAT 只要还没真过期就继续用（renew buffer 内但 create 挂了）。 */
+function reuseIfValid(existing: CodebasePat | null): CodebasePat | null {
+  if (existing?.token && existing.expires_at) {
+    const exp = new Date(existing.expires_at).getTime();
+    if (!Number.isNaN(exp) && exp > Date.now()) return existing;
+  }
+  return null;
 }
 
 /**

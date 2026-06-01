@@ -3621,6 +3621,47 @@ export function setUserCodebasePat(userId: string, pat: CodebasePatRecord): void
   ).run(JSON.stringify(secrets), new Date().toISOString(), userId);
 }
 
+// ── Per-user bytecloud JWT（user_secrets.bytecloud_jwt）──
+// B 方案回传：同事本机 `auth get-bytecloud-jwt-token` 拿的短效 JWT，给容器内
+// bytedcli 命令用（git 用 PAT 不用它）。JWT 短效，过期后同事重跑 login.sh 续。
+export interface BytecloudJwtRecord {
+  token: string;
+  host: string;
+  saved_at: string;
+}
+
+/** 读 user 的 bytecloud JWT（user_secrets JSON 的 bytecloud_jwt 字段），无则 null。 */
+export function getUserBytecloudJwt(userId: string): BytecloudJwtRecord | null {
+  const row = db
+    .prepare('SELECT user_secrets FROM users WHERE id = ?')
+    .get(userId) as { user_secrets?: string } | undefined;
+  if (!row?.user_secrets) return null;
+  try {
+    const secrets = JSON.parse(row.user_secrets) as Record<string, unknown>;
+    const jwt = secrets.bytecloud_jwt as BytecloudJwtRecord | undefined;
+    return jwt?.token ? jwt : null;
+  } catch {
+    return null;
+  }
+}
+
+/** 写 user 的 bytecloud JWT（merge 进 user_secrets，不动其它字段）。 */
+export function setUserBytecloudJwt(userId: string, jwt: BytecloudJwtRecord): void {
+  const row = db
+    .prepare('SELECT user_secrets FROM users WHERE id = ?')
+    .get(userId) as { user_secrets?: string } | undefined;
+  let secrets: Record<string, unknown> = {};
+  try {
+    if (row?.user_secrets) secrets = JSON.parse(row.user_secrets);
+  } catch {
+    /* corrupt → overwrite */
+  }
+  secrets.bytecloud_jwt = jwt;
+  db.prepare(
+    'UPDATE users SET user_secrets = ?, updated_at = ? WHERE id = ?',
+  ).run(JSON.stringify(secrets), new Date().toISOString(), userId);
+}
+
 // ── Per-user bytedcli SSO 状态机 helpers ──
 // 状态转移：
 //   none/expired --beginAuth--> pending (+complete_token, +started_at)

@@ -1,18 +1,19 @@
 /**
- * bytedcli-identity（JWT-based 身份注入）测试。
+ * bytedcli-identity（回传 PAT/JWT based 身份注入）测试。
  *
- * 验证（2026-06-01 重写——裸 mount device key 死路后改 JWT 注入）：
+ * 验证（2026-06-02 重写——B 方案：authed 用户用本机回传的 PAT/JWT，none 走 operator
+ * JWT 兜底，不再有 host sandbox / ensureCodebasePat）：
  *   ① flag off → null，不写文件
- *   ② inject on 非 per-user → operator HOME 拿 JWT，生成 .git-credentials(含 codebase jwt)
- *      + .gitconfig(helper=store) + jwt_override(含 bytecloud jwt)
- *   ③ fetchCredentialJwts 返 null（源未认证）→ ensureBytedcliIdentity null
- *   ④ CODEBASE_PAT → .git-credentials 用 x-access-token:pat，不调 fetchCredentialJwts
- *   ⑤ per-user authed + sandbox 存在 → sourceHome = sandbox（非 operator）
- *   ⑥ per-user pending/expired → null（强制 /login）
- *   ⑦ per-user none → operator 兜底
+ *   ② 非 per-user → operator JWT（x-jwt-token + jwt_override）
+ *   ③ fetchCredentialJwts 返 null（operator 未认证）→ null
+ *   ④ CODEBASE_PAT env → x-access-token:pat + best-effort operator JWT override
+ *   ⑤ per-user authed + 有回传 PAT → x-access-token:PAT + 回传 JWT override，不调 fetchCredentialJwts
+ *   ⑤b per-user authed 但无回传 PAT → null（强制 /login，不回落 operator）
+ *   ⑥ per-user pending/expired → null
+ *   ⑦ per-user none → operator JWT 兜底（不落 per-user 凭证）
  *   ⑧ getEffectiveOwnerId 修 created_by bug
  *
- * fetchCredentialJwts（execFileSync 真 bytedcli）+ db.getUserById mock 掉；e2e 在 mini 验。
+ * fetchCredentialJwts（execFileSync 真 bytedcli）+ db 读取 mock 掉；e2e 在 mini 验。
  */
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
 import fs from 'node:fs';
@@ -23,34 +24,34 @@ vi.mock('../src/logger.js', () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
 }));
 
-// db mock：getUserById（per-user status）+ codebase PAT 存取
+// db mock：getUserById（per-user status）+ 回传 PAT/JWT 读取
 const mockUserState: { [id: string]: { bytedcli_auth_status: string } } = {};
-const mockCodebasePat = { value: null as { token: string; id: string; expires_at: string } | null };
-const setPatCalls: Array<{ uid: string; pat: unknown }> = [];
+const mockCodebasePat = {
+  value: null as { token: string; id: string; expires_at: string } | null,
+};
+const mockBytecloudJwt = {
+  value: null as { token: string; host: string; saved_at: string } | null,
+};
 vi.mock('../src/db.js', () => ({
   getUserById: (id: string) => (mockUserState[id] ? { id, ...mockUserState[id] } : undefined),
   getUserCodebasePat: () => mockCodebasePat.value,
-  setUserCodebasePat: (uid: string, pat: unknown) => setPatCalls.push({ uid, pat }),
+  getUserBytecloudJwt: () => mockBytecloudJwt.value,
 }));
 
-// bytedcli-auth：fetchCredentialJwts(JWT) + ensureCodebasePat(PAT) 都记录 sourceHome；sandbox 路径 helper
+// bytedcli-auth：fetchCredentialJwts 记录 sourceHome 调用
 const fetchCalls: string[] = [];
-const ensurePatCalls: Array<{ sh: string; uid: string; existing: unknown }> = [];
-const mockFetch = { value: { codebaseJwt: 'CB_JWT', bytecloudJwt: 'BC_JWT', cloudHost: 'https://cloud.bytedance.net' } as { codebaseJwt: string; bytecloudJwt: string; cloudHost: string } | null };
-const mockPat = { value: { token: 'PAT_TOK', id: 'pid1', expires_at: '2099-01-01' } as { token: string; id: string; expires_at: string } | null };
-const mockHasAuthed = { value: true };
+const mockFetch = {
+  value: {
+    codebaseJwt: 'CB_JWT',
+    bytecloudJwt: 'BC_JWT',
+    cloudHost: 'https://cloud.bytedance.net',
+  } as { codebaseJwt: string; bytecloudJwt: string; cloudHost: string } | null,
+};
 vi.mock('../src/bytedcli-auth.js', () => ({
   fetchCredentialJwts: (sourceHome: string) => {
     fetchCalls.push(sourceHome);
     return mockFetch.value;
   },
-  ensureCodebasePat: (sourceHome: string, uid: string, existing: unknown) => {
-    ensurePatCalls.push({ sh: sourceHome, uid, existing });
-    return mockPat.value;
-  },
-  getUserBytedcliSandbox: (uid: string, dd: string) =>
-    path.join(dd, 'config', 'user-cli', uid, 'bytedcli-sandbox'),
-  hasAuthedSandbox: () => mockHasAuthed.value,
 }));
 
 import {
@@ -67,7 +68,7 @@ const savedEnv = { ...process.env };
 
 const mountRoot = () => path.join(dataDir, 'config', 'user-cli', OWNER, 'bytedcli-mount');
 const dataDirPath = () => path.join(mountRoot(), 'data');
-const gitCreds = () => path.join(dataDirPath(), '.git-credentials'); // 移到 rw data 目录内
+const gitCreds = () => path.join(dataDirPath(), '.git-credentials'); // 在 rw data 目录内
 const gitconfig = () => path.join(mountRoot(), '.gitconfig');
 
 beforeEach(() => {
@@ -79,12 +80,13 @@ beforeEach(() => {
   delete process.env.CODEBASE_PAT;
   process.env.BYTEDCLI_SOURCE_HOME = '/operator/home';
   fetchCalls.length = 0;
-  ensurePatCalls.length = 0;
-  setPatCalls.length = 0;
-  mockFetch.value = { codebaseJwt: 'CB_JWT', bytecloudJwt: 'BC_JWT', cloudHost: 'https://cloud.bytedance.net' };
-  mockPat.value = { token: 'PAT_TOK', id: 'pid1', expires_at: '2099-01-01' };
+  mockFetch.value = {
+    codebaseJwt: 'CB_JWT',
+    bytecloudJwt: 'BC_JWT',
+    cloudHost: 'https://cloud.bytedance.net',
+  };
   mockCodebasePat.value = null;
-  mockHasAuthed.value = true;
+  mockBytecloudJwt.value = null;
   for (const k of Object.keys(mockUserState)) delete mockUserState[k];
 });
 
@@ -97,7 +99,7 @@ afterEach(() => {
   }
 });
 
-describe('ensureBytedcliIdentity — JWT-based', () => {
+describe('ensureBytedcliIdentity — 回传 PAT/JWT based', () => {
   test('① flag off → null，不写文件', () => {
     process.env.BYTEDCLI_INJECT = 'false';
     expect(isBytedcliInjectEnabled()).toBe(false);
@@ -105,79 +107,85 @@ describe('ensureBytedcliIdentity — JWT-based', () => {
     expect(fs.existsSync(gitCreds())).toBe(false);
   });
 
-  test('② inject on 非 per-user → operator HOME + 生成三件套', () => {
+  test('② 非 per-user → operator JWT + 生成三件套', () => {
     const r = ensureBytedcliIdentity(OWNER, dataDir);
     expect(r).not.toBeNull();
-    // sourceHome 用 operator
     expect(fetchCalls).toEqual(['/operator/home']);
-    // .git-credentials 含 codebase jwt
     const creds = fs.readFileSync(gitCreds(), 'utf8');
     expect(creds).toContain('x-jwt-token:CB_JWT@code.byted.org');
-    // .gitconfig helper=store --file 指向 rw data 目录（避免 ro 写回 warning）
     const gc = fs.readFileSync(gitconfig(), 'utf8');
     expect(gc).toContain('helper = store --file=');
     expect(gc).toContain('/.git-credentials');
-    // jwt_override 含 bytecloud jwt
     const ov = fs.readFileSync(
       path.join(dataDirPath(), 'jwt_override.cloud.bytedance.net.json'),
       'utf8',
     );
     expect(ov).toContain('BC_JWT');
-    expect(ov).toContain('https://cloud.bytedance.net');
-    // 返回路径正确（.git-credentials 在 data 目录内，随 data mount 进容器）
-    expect(fs.existsSync(gitCreds())).toBe(true);
     expect(r!.hostDataDir).toBe(dataDirPath());
     expect(r!.hostGitconfig).toBe(gitconfig());
   });
 
-  test('③ fetchCredentialJwts 返 null（源未认证）→ null', () => {
+  test('② secret 文件 0600（共享机器不 world-readable）', () => {
+    ensureBytedcliIdentity(OWNER, dataDir);
+    expect(fs.statSync(gitCreds()).mode & 0o777).toBe(0o600);
+    expect(
+      fs.statSync(path.join(dataDirPath(), 'jwt_override.cloud.bytedance.net.json')).mode & 0o777,
+    ).toBe(0o600);
+  });
+
+  test('③ fetchCredentialJwts 返 null（operator 未认证）→ null', () => {
     mockFetch.value = null;
     expect(ensureBytedcliIdentity(OWNER, dataDir)).toBeNull();
     expect(fs.existsSync(gitCreds())).toBe(false);
   });
 
-  test('④ CODEBASE_PAT → .git-credentials 用 pat，不调 fetchCredentialJwts', () => {
+  test('④ CODEBASE_PAT → x-access-token:pat + best-effort operator JWT override', () => {
     process.env.CODEBASE_PAT = 'pat-xyz';
     const r = ensureBytedcliIdentity(OWNER, dataDir);
     expect(r).not.toBeNull();
-    expect(fetchCalls).toEqual([]); // pat 模式不拿 jwt
     expect(fs.readFileSync(gitCreds(), 'utf8')).toContain('x-access-token:pat-xyz@code.byted.org');
-  });
-
-  test('⑤ per-user authed → 自动 PAT，sourceHome=sandbox，creds 用 x-access-token', () => {
-    process.env.BYTEDCLI_PER_USER = 'true';
-    mockUserState[OWNER] = { bytedcli_auth_status: 'authed' };
-    mockHasAuthed.value = true;
-    const r = ensureBytedcliIdentity(OWNER, dataDir);
-    expect(r).not.toBeNull();
-    // ensureCodebasePat 在 sandbox HOME 跑
-    expect(ensurePatCalls[0].sh).toBe(
-      path.join(dataDir, 'config', 'user-cli', OWNER, 'bytedcli-sandbox'),
+    // env-pat 仍顺带拿 operator bytecloud JWT
+    expect(fetchCalls).toEqual(['/operator/home']);
+    expect(fs.existsSync(path.join(dataDirPath(), 'jwt_override.cloud.bytedance.net.json'))).toBe(
+      true,
     );
-    // .git-credentials 用 PAT
-    expect(fs.readFileSync(gitCreds(), 'utf8')).toContain('x-access-token:PAT_TOK@code.byted.org');
-    // 新 PAT 落库
-    expect(setPatCalls.length).toBe(1);
   });
 
-  test('⑤b per-user PAT 复用（existing 有效）→ ensureCodebasePat 收到 existing，不重复落库', () => {
+  test('⑤ per-user authed + 回传 PAT/JWT → 用用户自己的凭证，不调 fetchCredentialJwts', () => {
     process.env.BYTEDCLI_PER_USER = 'true';
     mockUserState[OWNER] = { bytedcli_auth_status: 'authed' };
-    const existing = { token: 'PAT_TOK', id: 'pid1', expires_at: '2099-01-01' };
-    mockCodebasePat.value = existing;
-    mockPat.value = existing; // ensureCodebasePat 复用返回同一个
+    mockCodebasePat.value = { token: 'USER_PAT', id: 'pid', expires_at: '2099-01-01' };
+    mockBytecloudJwt.value = {
+      token: 'USER_BC_JWT',
+      host: 'https://cloud.tiktok-row.net',
+      saved_at: '2026-06-02',
+    };
     const r = ensureBytedcliIdentity(OWNER, dataDir);
     expect(r).not.toBeNull();
-    expect(ensurePatCalls[0].existing).toEqual(existing);
-    // token 没变 → 不重复 setUserCodebasePat
-    expect(setPatCalls.length).toBe(0);
+    expect(fs.readFileSync(gitCreds(), 'utf8')).toContain('x-access-token:USER_PAT@code.byted.org');
+    // authed 走 DB 凭证，不调 operator fetchCredentialJwts
+    expect(fetchCalls).toEqual([]);
+    // 回传 JWT 写到对应 host 的 override
+    const ov = fs.readFileSync(
+      path.join(dataDirPath(), 'jwt_override.cloud.tiktok-row.net.json'),
+      'utf8',
+    );
+    expect(ov).toContain('USER_BC_JWT');
   });
 
-  test('⑥ per-user pending → null（强制 /login）', () => {
+  test('⑤b per-user authed 但无回传 PAT → null（强制 /login，不回落 operator）', () => {
+    process.env.BYTEDCLI_PER_USER = 'true';
+    mockUserState[OWNER] = { bytedcli_auth_status: 'authed' };
+    mockCodebasePat.value = null;
+    expect(ensureBytedcliIdentity(OWNER, dataDir)).toBeNull();
+    expect(fetchCalls).toEqual([]); // 不回落 operator
+    expect(fs.existsSync(gitCreds())).toBe(false);
+  });
+
+  test('⑥ per-user pending → null', () => {
     process.env.BYTEDCLI_PER_USER = 'true';
     mockUserState[OWNER] = { bytedcli_auth_status: 'pending' };
     expect(ensureBytedcliIdentity(OWNER, dataDir)).toBeNull();
-    expect(ensurePatCalls).toEqual([]);
   });
 
   test('⑥b per-user expired → null', () => {
@@ -186,28 +194,19 @@ describe('ensureBytedcliIdentity — JWT-based', () => {
     expect(ensureBytedcliIdentity(OWNER, dataDir)).toBeNull();
   });
 
-  test('⑥c per-user ensureCodebasePat 失败 → null', () => {
-    process.env.BYTEDCLI_PER_USER = 'true';
-    mockUserState[OWNER] = { bytedcli_auth_status: 'authed' };
-    mockPat.value = null;
-    expect(ensureBytedcliIdentity(OWNER, dataDir)).toBeNull();
-  });
-
-  test('⑦ per-user none → 自动 PAT，sourceHome=operator', () => {
+  test('⑦ per-user none → operator JWT 兜底（x-jwt-token，不落 per-user 凭证）', () => {
     process.env.BYTEDCLI_PER_USER = 'true';
     mockUserState[OWNER] = { bytedcli_auth_status: 'none' };
     const r = ensureBytedcliIdentity(OWNER, dataDir);
     expect(r).not.toBeNull();
-    expect(ensurePatCalls[0].sh).toBe('/operator/home');
+    expect(fetchCalls).toEqual(['/operator/home']);
+    expect(fs.readFileSync(gitCreds(), 'utf8')).toContain('x-jwt-token:CB_JWT@code.byted.org');
   });
 
-  test('per-user authed 但 sandbox 缺失 → 回落 operator HOME 跑 PAT', () => {
+  test('per-user user row 缺失 → null', () => {
     process.env.BYTEDCLI_PER_USER = 'true';
-    mockUserState[OWNER] = { bytedcli_auth_status: 'authed' };
-    mockHasAuthed.value = false;
-    const r = ensureBytedcliIdentity(OWNER, dataDir);
-    expect(r).not.toBeNull();
-    expect(ensurePatCalls[0].sh).toBe('/operator/home');
+    // mockUserState 不设 OWNER → getUserById undefined
+    expect(ensureBytedcliIdentity(OWNER, dataDir)).toBeNull();
   });
 });
 

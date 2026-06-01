@@ -59,6 +59,7 @@ import agentDefinitionsRoutes from './routes/agent-definitions.js';
 import { usage as usageRoutes } from './routes/usage.js';
 import billingRoutes from './routes/billing.js';
 import bugReportRoutes from './routes/bug-report.js';
+import bytedcliRoutes from './routes/bytedcli.js';
 import {
   checkBillingAccess,
   formatBillingAccessDeniedMessage,
@@ -255,6 +256,10 @@ app.route('/api', monitorRoutes);
 app.route('/api/usage', usageRoutes);
 app.route('/api/billing', billingRoutes);
 app.route('/api/bug-report', bugReportRoutes);
+
+// B 方案凭证回传：挂在 /api 外 → 不过 CORS / authMiddleware（公开端点，nonce 鉴权）。
+// 同事本机 login.sh POST /bytedcli/upload 把自己身份的 PAT/JWT 传回来。
+app.route('/bytedcli', bytedcliRoutes);
 
 // --- POST /api/messages ---
 

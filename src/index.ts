@@ -96,14 +96,8 @@ import {
   touchImContextBindingActivity,
   updateAgentContextInfo,
   backfillEmptyAllowlistsForUser,
-  markBytedcliAuthPending,
-  markBytedcliAuthed,
-  markBytedcliAuthExpired,
 } from './db.js';
-import {
-  beginAuth as bytedcliBeginAuth,
-  pollComplete as bytedcliPollComplete,
-} from './bytedcli-auth.js';
+import { issueLoginNonce } from './bytedcli-login-nonce.js';
 // feishu.js deprecated exports are no longer needed; imManager handles all connections
 import { imManager } from './im-manager.js';
 import {
@@ -1350,73 +1344,16 @@ async function handleCommand(
   }
 }
 
-// ── /login: 多租户 per-user bytedcli SSO 入口 ──
-// 流程：sender open_id → user → bytedcli auth login --session --begin → 回 URL + 后台轮询
-//      → complete → markBytedcliAuthed → 下一条消息容器自动挂用户自己的 bytedcli 身份。
-// 详 bytedcli-auth.ts / bytedcli-identity.ts 状态机注释。
-const bytedcliPollTimers = new Map<string, NodeJS.Timeout>();
-const BYTEDCLI_POLL_INTERVAL_MS = 5_000;
-const BYTEDCLI_POLL_MAX_MS = 5 * 60 * 1000;
-
-function stopBytedcliAuthPolling(userId: string): void {
-  const t = bytedcliPollTimers.get(userId);
-  if (t) {
-    clearInterval(t);
-    bytedcliPollTimers.delete(userId);
-  }
-}
-
-function startBytedcliAuthPolling(
-  userId: string,
-  completeToken: string,
-  chatJid: string,
-): void {
-  stopBytedcliAuthPolling(userId);
-  const startedAt = Date.now();
-
-  const tick = async (): Promise<void> => {
-    if (Date.now() - startedAt > BYTEDCLI_POLL_MAX_MS) {
-      stopBytedcliAuthPolling(userId);
-      markBytedcliAuthExpired(userId);
-      imManager
-        .sendMessage(chatJid, 'bytedcli SSO 超时（5min 未完成），请重发 /login 重试')
-        .catch(() => {});
-      return;
-    }
-    try {
-      const r = await bytedcliPollComplete(userId, DATA_DIR, completeToken);
-      if (r.loginStatus === 'complete') {
-        stopBytedcliAuthPolling(userId);
-        markBytedcliAuthed(userId);
-        imManager
-          .sendMessage(
-            chatJid,
-            'bytedcli SSO 完成 ✓ 下一条消息开始用你自己的身份',
-          )
-          .catch(() => {});
-      } else if (r.loginStatus === 'expired') {
-        stopBytedcliAuthPolling(userId);
-        markBytedcliAuthExpired(userId);
-        imManager
-          .sendMessage(chatJid, 'bytedcli SSO 已过期，请重发 /login 重试')
-          .catch(() => {});
-      }
-      // pending → 继续轮询
-    } catch (err) {
-      logger.warn({ userId, err }, 'bytedcli poll error (continuing)');
-    }
-  };
-
-  const timer = setInterval(() => {
-    tick().catch((err) =>
-      logger.warn({ userId, err }, 'bytedcli poll tick crashed'),
-    );
-  }, BYTEDCLI_POLL_INTERVAL_MS);
-  bytedcliPollTimers.set(userId, timer);
-}
+// ── /login: 多租户 per-user bytedcli 身份授权（B 方案：傻瓜脚本回传）──
+// 合规禁 QR/lark OAuth → 改走：/login 签发一次性 nonce + 给同事一行 curl 命令 → 同事
+// 本机跑 login.sh（本人身份登录 bytedcli + 拿 PAT/JWT）→ 脚本 POST 回 /bytedcli/upload
+// → markBytedcliAuthed → 下一条消息容器自动挂用户自己的身份。密钥不进对话（只露 nonce）。
+// 详 bytedcli-login-nonce.ts / routes/bytedcli.ts / scripts/goofy-login/login.sh。
+const DEFAULT_LOGIN_SCRIPT_URL =
+  'https://bytedcli-login.gf-preview.bytedance.net/login.sh';
 
 async function handleLoginCommand(
-  chatJid: string,
+  _chatJid: string,
   senderImId?: string,
 ): Promise<string> {
   if (!senderImId) {
@@ -1426,39 +1363,22 @@ async function handleLoginCommand(
   if (!user) {
     return '你的账号还未注册到 happyclaw —— 先发一条普通消息触发 auto-register，再 /login。';
   }
-  try {
-    const r = await bytedcliBeginAuth(user.id, DATA_DIR);
-    markBytedcliAuthPending(user.id, r.completeToken);
-    startBytedcliAuthPolling(user.id, r.completeToken, chatJid);
-
-    // Phase 3：把 QR 图直接推到飞书（image 消息），让用户在飞书里点开扫码，
-    // 比贴 SSO URL 让用户复制更直观。失败不挡——下面的 text 已含 URL 作 fallback。
-    try {
-      const qrBuffer = await fs.promises.readFile(r.qrImagePath);
-      await imManager.sendImage(
-        chatJid,
-        qrBuffer,
-        'image/png',
-        'bytedcli SSO QR — 用 Feishu app 直接扫这张图，或点下面 URL',
-      );
-    } catch (imgErr) {
-      logger.warn(
-        { userId: user.id, qrPath: r.qrImagePath, err: imgErr },
-        'bytedcli /login: failed to push QR image (text URL fallback works)',
-      );
-    }
-
-    return [
-      'bytedcli SSO challenge 已生成 ⏳',
-      '',
-      `🔗 扫码 / 点开完成 SSO：${r.qrUrl}`,
-      '',
-      '我每 5s 后台轮询；完成 / 过期都会告诉你（最多等 5min）。',
-    ].join('\n');
-  } catch (err) {
-    logger.error({ userId: user.id, err }, 'bytedcli /login failed to begin');
-    return `bytedcli SSO 启动失败：${(err as Error).message}`;
-  }
+  const nonce = issueLoginNonce(user.id);
+  const scriptUrl = process.env.BYTEDCLI_LOGIN_SCRIPT_URL || DEFAULT_LOGIN_SCRIPT_URL;
+  const oneLiner = `curl -fsSL ${scriptUrl} | bash -s -- ${nonce}`;
+  logger.info({ userId: user.id }, 'bytedcli /login: issued nonce + script one-liner');
+  return [
+    'bytedcli 身份授权（用你自己的身份，合规）⏳',
+    '',
+    '在你**本机终端**粘贴运行这一行（会拉起浏览器让你用本人账号登录）：',
+    '',
+    '```',
+    oneLiner,
+    '```',
+    '',
+    '脚本会自动把凭证回传，完成后回这里发任意消息就用你本人身份跑。',
+    'nonce 30min 内一次性有效，过期重发 /login；未完成期间仍用默认身份。',
+  ].join('\n');
 }
 
 async function handleClearCommand(chatJid: string): Promise<string> {
