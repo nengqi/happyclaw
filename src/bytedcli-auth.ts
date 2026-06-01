@@ -131,8 +131,10 @@ export function ensureCodebasePat(
         'codebase',
         'pat',
         'create',
+        // PAT name 有 max 长度限制（全 36 位 UUID 超限报 InvalidParameter.Name）→ 取前 8 位。
+        // dedup/delete 靠 DB 存的 PAT id，不靠 name，故短名可读即可。
         '--name',
-        `happyclaw-${userId}`,
+        `happyclaw-${userId.slice(0, 8)}`,
         '--scopes',
         'repo.content:read,repo:download',
         '--json',
