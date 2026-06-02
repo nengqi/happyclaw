@@ -35,6 +35,25 @@ fi
 say "bytedcli 已登录 ($SITE)"
 
 # 2) 自助创建 codebase PAT（90 天，长效，自包含不绑 device key → 可跨机回传）
+# 先删本账号已有的 happyclaw-* PAT（token 不可重读必须新建，但避免每次 /login 累积孤儿；
+# 失败重跑留下的 PAT 也在这里被清）。
+OLD_IDS="$(bytedcli --site "$SITE" codebase pat list --json 2>/dev/null | python3 -c '
+import json,sys
+for ln in reversed(sys.stdin.read().strip().splitlines()):
+    ln=ln.strip()
+    if ln.startswith("{") and ln.endswith("}"):
+        d=json.loads(ln); data=d.get("data") or {}
+        pats=[]
+        if isinstance(data,dict):
+            for v in data.values():
+                if isinstance(v,list): pats=v; break
+        for p in pats:
+            n=(p.get("Name") or p.get("name") or "")
+            if n.startswith("happyclaw-"): print(p.get("Id") or p.get("id"))
+        break
+' 2>/dev/null || true)"
+for oid in $OLD_IDS; do bytedcli --site "$SITE" codebase pat delete --id "$oid" --json >/dev/null 2>&1 || true; done
+
 say "创建 codebase PAT..."
 PAT_JSON="$(bytedcli --site "$SITE" codebase pat create \
   --name "happyclaw-$(date +%m%d%H%M)" \
@@ -49,7 +68,7 @@ JWT_JSON="$(bytedcli --site "$SITE" auth get-bytecloud-jwt-token --json 2>/dev/n
 say "回传凭证到 happyclaw..."
 PAT_JSON="$PAT_JSON" JWT_JSON="$JWT_JSON" NONCE="$NONCE" PORT="$PORT" SITE="$SITE" \
   MACMINI_IP="${MACMINI_IP:-}" IPS_URL="$IPS_URL" python3 - <<'PY'
-import json, os, sys, urllib.request, urllib.error
+import json, os, subprocess, sys, urllib.request, urllib.error
 
 def parse_last_json(s):
     """bytedcli --json 末行是 {...}（status 字段）；取最后一个能解析的 JSON 行。"""
@@ -94,6 +113,9 @@ body = json.dumps({
     "bytecloudJwt": jwt, "cloudHost": host,
 }).encode()
 
+# 回传目标永远是内网 IP/域名 → 强制绕代理（同事机器常挂公司代理把 10.x 拦成 502）
+opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
 # 候选 IP：手动 MACMINI_IP 优先，否则从 /ips.txt 取 10.x/172.x/192.168.x active
 candidates = []
 manual = os.environ.get("MACMINI_IP", "").strip()
@@ -101,7 +123,7 @@ if manual:
     candidates = [manual]
 else:
     try:
-        txt = urllib.request.urlopen(os.environ["IPS_URL"], timeout=12).read().decode()
+        txt = opener.open(os.environ["IPS_URL"], timeout=12).read().decode()
         for line in txt.splitlines():
             parts = line.split()
             if len(parts) >= 2 and parts[1].split(".")[0] in ("10", "172", "192") and "169.254" not in parts[1]:
@@ -119,13 +141,22 @@ for ip in candidates:
     url = f"http://{ip}:{port}/bytedcli/upload"
     try:
         req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with opener.open(req, timeout=10) as resp:
             print(f"✓ 回传成功 → {ip}:{port}  (PAT={'yes' if pat else 'no'} JWT={'yes' if jwt else 'no'})")
             sys.exit(0)
     except Exception as e:
         last_err = f"{ip}: {e}"
         continue
 
+# 回传失败：删掉本次刚建的 PAT，避免孤儿（pre-create 清理是下轮才生效，这里即时清）
+if pat_id:
+    try:
+        subprocess.run(["bytedcli", "--site", os.environ.get("SITE", "i18n-tt"),
+                        "codebase", "pat", "delete", "--id", pat_id, "--json"],
+                       capture_output=True, timeout=15)
+        print(f"  (已清理本次创建的 PAT {pat_id})")
+    except Exception:
+        pass
 sys.exit(f"✗ 所有候选 IP 回传失败，最后错误：{last_err}")
 PY
 
