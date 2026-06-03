@@ -14,6 +14,7 @@
  */
 import { Hono } from 'hono';
 
+import { cloudHostForCurrentSite } from '../bytedcli-auth.js';
 import { consumeLoginNonce } from '../bytedcli-login-nonce.js';
 import {
   getUserById,
@@ -45,21 +46,22 @@ bytedcliRoutes.post('/upload', async (c) => {
 
   const pat = typeof body.pat === 'string' ? body.pat : '';
   const bytecloudJwt = typeof body.bytecloudJwt === 'string' ? body.bytecloudJwt : '';
-  if (!pat && !bytecloudJwt) {
-    return c.json({ error: 'no credential (need pat or bytecloudJwt)' }, 400);
+  // PAT 是 codebase 身份注入硬需求（authed 分支无 PAT 直接 skip）；只有 JWT 会标 authed 却让
+  // 容器拿不到身份（静默坏态，rv #2）。故必须有 PAT，JWT 可选。
+  if (!pat) {
+    return c.json({ error: 'missing pat (required for codebase identity; jwt alone not enough)' }, 400);
   }
 
-  if (pat) {
-    setUserCodebasePat(userId, {
-      token: pat,
-      id: typeof body.patId === 'string' ? body.patId : '',
-      expires_at: typeof body.patExpiresAt === 'string' ? body.patExpiresAt : '',
-    });
-  }
+  setUserCodebasePat(userId, {
+    token: pat,
+    id: typeof body.patId === 'string' ? body.patId : '',
+    expires_at: typeof body.patExpiresAt === 'string' ? body.patExpiresAt : '',
+  });
   if (bytecloudJwt) {
+    // cloudHost 服务端按部署 site 推导，不信任客户端 body（防 jwt_override.${host}.json 路径穿越，rv #3）
     setUserBytecloudJwt(userId, {
       token: bytecloudJwt,
-      host: typeof body.cloudHost === 'string' ? body.cloudHost : '',
+      host: cloudHostForCurrentSite(),
       saved_at: new Date().toISOString(),
     });
   }

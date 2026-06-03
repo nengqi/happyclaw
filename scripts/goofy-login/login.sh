@@ -104,8 +104,8 @@ pat_exp = pat_data.get("expires_at", "") if isinstance(pat_data, dict) else ""
 jwt = (jwt_data.get("jwt") or jwt_data.get("token") or "") if isinstance(jwt_data, dict) else ""
 host = SITE_HOST.get(os.environ.get("SITE", ""), "")
 
-if not pat and not jwt:
-    sys.exit("✗ 没拿到 PAT 或 JWT（bytedcli 输出异常，重跑或检查登录态）")
+if not pat:
+    sys.exit("✗ 没拿到 codebase PAT（bytedcli 输出异常或登录态失效，重跑）；PAT 是 git 身份必需，JWT 单独不够")
 
 body = json.dumps({
     "nonce": os.environ["NONCE"],
@@ -151,12 +151,15 @@ for ip in candidates:
 # 回传失败：删掉本次刚建的 PAT，避免孤儿（pre-create 清理是下轮才生效，这里即时清）
 if pat_id:
     try:
-        subprocess.run(["bytedcli", "--site", os.environ.get("SITE", "i18n-tt"),
-                        "codebase", "pat", "delete", "--id", pat_id, "--json"],
-                       capture_output=True, timeout=15)
-        print(f"  (已清理本次创建的 PAT {pat_id})")
+        _r = subprocess.run(["bytedcli", "--site", os.environ.get("SITE", "i18n-tt"),
+                             "codebase", "pat", "delete", "--id", pat_id, "--json"],
+                            capture_output=True, timeout=15)
+        if _r.returncode == 0:
+            print(f"  (已清理本次创建的 PAT {pat_id})")
+        else:
+            print(f"  ⚠ 清理 PAT {pat_id} 失败，请手动 bytedcli codebase pat delete --id {pat_id}", file=sys.stderr)
     except Exception:
-        pass
+        print(f"  ⚠ 清理 PAT {pat_id} 异常，请手动删 --id {pat_id}", file=sys.stderr)
 sys.exit(f"✗ 所有候选 IP 回传失败，最后错误：{last_err}")
 PY
 

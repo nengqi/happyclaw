@@ -34,6 +34,11 @@ const SITE_CLOUD_HOST: Record<string, string> = {
   'us-ttp': 'https://cloud-ttp-us.bytedance.net',
 };
 
+/** 当前部署 site 对应的 ByteCloud 域名（server-side 推导，不信任客户端传入，防路径穿越）。 */
+export function cloudHostForCurrentSite(): string {
+  return SITE_CLOUD_HOST[bytedcliSite()] || 'https://cloud.bytedance.net';
+}
+
 export interface CredentialJwts {
   /** Codebase JWT（git 拉 code.byted.org 用，password 位）。 */
   codebaseJwt: string;

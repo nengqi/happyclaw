@@ -246,7 +246,9 @@ export function ensureBytedcliIdentity(
     }
     // bytecloud JWT override（供容器内 bytedcli 命令；git 不需要它）
     if (bytecloudJwt) {
-      const host = cloudHost.replace(/^https?:\/\//, '');
+      // host 现由 server-side site 推导（routes/bytedcli），仍 sanitize 防路径穿越（rv #3 防御纵深）：
+      // 去协议头 + 只留 [a-z0-9.-]，杜绝 / \ .. 逃出 mountDataDir
+      const host = cloudHost.replace(/^https?:\/\//, '').replace(/[^a-zA-Z0-9.-]/g, '_');
       const overrideFile = path.join(mountDataDir, `jwt_override.${host}.json`);
       fs.writeFileSync(
         overrideFile,
